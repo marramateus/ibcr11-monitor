@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 from io import StringIO
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
@@ -9,7 +9,6 @@ import plotly.express as px
  
 st.set_page_config(page_title="IBCR11 Monitor", page_icon="📊", layout="wide")
  
-# ── Constantes ────────────────────────────────────────────────────────────────
 CNPJ_IBCR11 = "14744231000114"
  
 CRIS = [
@@ -35,76 +34,103 @@ FALLBACK_CVM = {
     "pl_total": 86572000.0,
     "cotas": 958423,
     "dividendo_cota": 0.60,
-    "competencia": "jan/2026",
+    "competencia": "2026-01",
     "fonte": "estatico (jan/2026)"
 }
  
-# ── CVM API ───────────────────────────────────────────────────────────────────
+# ── Gera lista de meses disponíveis (jun/2021 até hoje) ──────────────────────
+def gerar_meses():
+    inicio = date(2021, 6, 1)
+    hoje = date.today()
+    meses = []
+    d = date(inicio.year, inicio.month, 1)
+    while d <= date(hoje.year, hoje.month, 1):
+        meses.append(d.strftime("%Y-%m"))
+        if d.month == 12:
+            d = date(d.year + 1, 1, 1)
+        else:
+            d = date(d.year, d.month + 1, 1)
+    return list(reversed(meses))  # mais recente primeiro
+ 
+MESES = gerar_meses()
+LABELS = {m: datetime.strptime(m, "%Y-%m").strftime("%b/%Y").lower() for m in MESES}
+ 
+# ── CVM: carrega CSV anual completo ──────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def get_dados_cvm():
-    ano = datetime.now().year
-    for ano_tentativa in [ano, ano - 1]:
-        url = f"https://dados.cvm.gov.br/dados/FII/doc/inf_mensal/dados/inf_mensal_fii_{ano_tentativa}.csv"
-        try:
-            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200 or len(r.content) < 500:
-                continue
-            df = pd.read_csv(StringIO(r.text), sep=";", encoding="latin1", dtype=str)
-            df.columns = df.columns.str.strip().str.upper()
- 
-            # Achar coluna CNPJ
-            cnpj_col = next((c for c in df.columns if "CNPJ" in c and "FUNDO" in c), None)
-            if cnpj_col is None:
-                continue
- 
-            df_fii = df[df[cnpj_col].str.replace(r"\D", "", regex=True) == CNPJ_IBCR11].copy()
-            if df_fii.empty:
-                continue
- 
-            # Ordenar pela data mais recente
-            data_col = next((c for c in df_fii.columns if any(x in c for x in ["COMPET", "DT_REF", "DATA"])), None)
-            if data_col:
-                df_fii = df_fii.sort_values(data_col)
- 
-            row = df_fii.iloc[-1]
- 
-            def v(chave, default=None):
-                col = next((c for c in df_fii.columns if chave in c), None)
-                if col is None:
-                    return default
-                try:
-                    return float(str(row[col]).replace(",", "."))
-                except:
-                    return default
- 
-            vp        = v("VL_PATRIM_COTA",    FALLBACK_CVM["vp"])
-            pl        = v("VL_PATRIM_LIQ",     FALLBACK_CVM["pl_total"])
-            cotas     = v("NR_COTAS",          FALLBACK_CVM["cotas"])
-            dividendo = v("VL_RENDIMENTO",     FALLBACK_CVM["dividendo_cota"])
-            competencia = str(row[data_col])[:7] if data_col else FALLBACK_CVM["competencia"]
- 
-            dy = round(dividendo / vp * 100, 2) if vp and dividendo else FALLBACK_CVM["dy_mensal"]
- 
-            return {
-                "vp": vp,
-                "vp_delta": round(vp - FALLBACK_CVM["vp"], 2),
-                "dy_mensal": dy,
-                "dy_delta": round(dy - FALLBACK_CVM["dy_mensal"], 2),
-                "pl_total": pl or FALLBACK_CVM["pl_total"],
-                "cotas": int(cotas) if cotas else FALLBACK_CVM["cotas"],
-                "dividendo_cota": dividendo or FALLBACK_CVM["dividendo_cota"],
-                "competencia": competencia,
-                "fonte": f"CVM ({competencia})"
-            }
-        except Exception as e:
-            continue
- 
-    return FALLBACK_CVM
- 
-@st.cache_data(ttl=900)
-def get_cotacao():
+def carregar_csv_cvm(ano):
+    url = f"https://dados.cvm.gov.br/dados/FII/doc/inf_mensal/dados/inf_mensal_fii_{ano}.csv"
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/IBCR11.SA?interval=1d&range=3mo"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or len(r.content) < 500:
+            return None
+        df = pd.read_csv(StringIO(r.text), sep=";", encoding="latin1", dtype=str)
+        df.columns = df.columns.str.strip().str.upper()
+        cnpj_col = next((c for c in df.columns if "CNPJ" in c and "FUNDO" in c), None)
+        if cnpj_col is None:
+            return None
+        df = df[df[cnpj_col].str.replace(r"\D", "", regex=True) == CNPJ_IBCR11].copy()
+        return df if not df.empty else None
+    except:
+        return None
+ 
+def get_dados_cvm_mes(ano_mes):
+    ano = int(ano_mes[:4])
+    dfs = []
+    for a in [ano, ano - 1]:
+        df = carregar_csv_cvm(a)
+        if df is not None:
+            dfs.append(df)
+    if not dfs:
+        return {**FALLBACK_CVM, "fonte": "CVM indisponivel — usando estatico"}
+ 
+    df_all = pd.concat(dfs, ignore_index=True)
+    data_col = next((c for c in df_all.columns if any(x in c for x in ["COMPET", "DT_REF", "DATA"])), None)
+    if data_col is None:
+        return {**FALLBACK_CVM, "fonte": "coluna data nao encontrada"}
+ 
+    # Normaliza para YYYY-MM
+    df_all["_mes"] = pd.to_datetime(df_all[data_col], errors="coerce").dt.strftime("%Y-%m")
+    df_mes = df_all[df_all["_mes"] == ano_mes]
+ 
+    if df_mes.empty:
+        return {**FALLBACK_CVM, "fonte": f"sem dado CVM para {LABELS.get(ano_mes, ano_mes)}"}
+ 
+    row = df_mes.iloc[-1]
+ 
+    def v(chave, default=None):
+        col = next((c for c in df_mes.columns if chave in c), None)
+        if col is None:
+            return default
+        try:
+            return float(str(row[col]).replace(",", "."))
+        except:
+            return default
+ 
+    vp        = v("VL_PATRIM_COTA",    FALLBACK_CVM["vp"])
+    pl        = v("VL_PATRIM_LIQ",     FALLBACK_CVM["pl_total"])
+    cotas     = v("NR_COTAS",          FALLBACK_CVM["cotas"])
+    dividendo = v("VL_RENDIMENTO",     FALLBACK_CVM["dividendo_cota"])
+    dy        = round(dividendo / vp * 100, 2) if vp and dividendo else FALLBACK_CVM["dy_mensal"]
+    label     = LABELS.get(ano_mes, ano_mes)
+ 
+    return {
+        "vp": vp or FALLBACK_CVM["vp"],
+        "vp_delta": 0.0,
+        "dy_mensal": dy,
+        "dy_delta": 0.0,
+        "pl_total": pl or FALLBACK_CVM["pl_total"],
+        "cotas": int(cotas) if cotas else FALLBACK_CVM["cotas"],
+        "dividendo_cota": dividendo or FALLBACK_CVM["dividendo_cota"],
+        "competencia": ano_mes,
+        "fonte": f"CVM ({label})"
+    }
+ 
+# ── Cotação histórica (Yahoo Finance) ────────────────────────────────────────
+@st.cache_data(ttl=900)
+def get_cotacao(periodo):
+    # periodo: "1mo","3mo","6mo","1y","2y","5y"
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/IBCR11.SA?interval=1d&range={periodo}"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         d = r.json()["chart"]["result"][0]
         df = pd.DataFrame({
@@ -118,39 +144,47 @@ def get_cotacao():
  
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Configuracoes")
-    api_key = st.text_input("Anthropic API Key (opcional)", type="password")
+    st.header("Periodo de referencia")
+ 
+    mes_sel = st.selectbox(
+        "Mes/Ano",
+        MESES,
+        format_func=lambda m: LABELS[m],
+        index=0
+    )
+ 
+    periodo_cotacao = st.select_slider(
+        "Historico B3",
+        options=["1mo", "3mo", "6mo", "1y", "2y", "5y"],
+        value="3mo"
+    )
+ 
     st.divider()
-    filtro = st.multiselect("Filtrar por status", ["CRITICO", "ATENCAO", "NORMAL"],
+    api_key = st.text_input("Anthropic API Key (opcional)", type="password")
+    filtro = st.multiselect("Filtrar CRIs por status",
+                            ["CRITICO", "ATENCAO", "NORMAL"],
                             default=["CRITICO", "ATENCAO", "NORMAL"])
     st.divider()
-    if st.button("Atualizar dados CVM"):
+    if st.button("Limpar cache"):
         st.cache_data.clear()
         st.rerun()
  
-# ── Header ────────────────────────────────────────────────────────────────────
-cvm = get_dados_cvm()
-cotacao = get_cotacao()
+# ── Carrega dados do mês selecionado ─────────────────────────────────────────
+cvm     = get_dados_cvm_mes(mes_sel)
+cotacao = get_cotacao(periodo_cotacao)
  
-vm = cotacao.iloc[-1]["fechamento"] if cotacao is not None else 49.24
+vm      = cotacao.iloc[-1]["fechamento"] if cotacao is not None else 49.24
 desagio = round((1 - vm / cvm["vp"]) * 100, 2)
  
+# ── Header KPIs ───────────────────────────────────────────────────────────────
 st.title("IBCR11 — Monitor de CRIs")
 st.caption(f"Dados fundamentais: {cvm['fonte']} | Cotacao: Yahoo Finance (15min delay)")
  
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("VP (cota patrimonial)",
-          f"R$ {cvm['vp']:.2f}",
-          f"{cvm['vp_delta']:+.2f}" if cvm["vp_delta"] != 0 else None)
-c2.metric("VM (cota mercado)",
-          f"R$ {vm:.2f}")
-c3.metric("Desagio VM/VP",
-          f"{desagio:.2f}%",
-          delta_color="inverse")
-c4.metric("DY Mensal",
-          f"{cvm['dy_mensal']:.2f}%",
-          f"{cvm['dy_delta']:+.2f} pp" if cvm["dy_delta"] != 0 else None,
-          delta_color="inverse")
+c1.metric("VP (cota patrimonial)", f"R$ {cvm['vp']:.2f}")
+c2.metric("VM (cota mercado)",     f"R$ {vm:.2f}")
+c3.metric("Desagio VM/VP",         f"{desagio:.2f}%", delta_color="inverse")
+c4.metric("DY Mensal",             f"{cvm['dy_mensal']:.2f}%")
 st.divider()
  
 tab1, tab2, tab3, tab4 = st.tabs(["Carteira", "Monitorar CRIs", "Cotacao", "Stress Test"])
@@ -212,7 +246,7 @@ with tab2:
  
     def buscar_google_rss(q):
         url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=10)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=10)
         soup = BeautifulSoup(r.content, "html.parser")
         items = soup.find_all("item")
         if not items:
@@ -294,7 +328,8 @@ with tab2:
  
 # ── TAB 3 ─────────────────────────────────────────────────────────────────────
 with tab3:
-    st.subheader("Cotacao IBCR11 — ultimos 3 meses")
+    label_periodo = {"1mo":"1 mes","3mo":"3 meses","6mo":"6 meses","1y":"1 ano","2y":"2 anos","5y":"5 anos"}
+    st.subheader(f"Cotacao IBCR11 — {label_periodo.get(periodo_cotacao, periodo_cotacao)}")
  
     if cotacao is not None:
         u = cotacao.iloc[-1]
@@ -303,13 +338,14 @@ with tab3:
         m2.metric("Volume ultimo pregao", f"{int(u['volume']):,}" if pd.notna(u["volume"]) else "—")
         m3.metric("Desagio sobre VP",     f"{(1 - u['fechamento']/cvm['vp'])*100:.1f}%", delta_color="inverse")
  
+        # Linha VP do mês selecionado
         fc = go.Figure()
         fc.add_trace(go.Scatter(x=cotacao["data"], y=cotacao["fechamento"],
                                 mode="lines", name="Fechamento",
                                 line=dict(color="#378ADD", width=2)))
         fc.add_hline(y=cvm["vp"], line_dash="dash", line_color="#E24B4A",
-                     annotation_text=f"VP R${cvm['vp']:.2f}")
-        fc.update_layout(height=350, yaxis_title="R$", margin=dict(t=20,b=20,l=10,r=80))
+                     annotation_text=f"VP {LABELS[mes_sel]} R${cvm['vp']:.2f}")
+        fc.update_layout(height=380, yaxis_title="R$", margin=dict(t=20,b=20,l=10,r=120))
         st.plotly_chart(fc, use_container_width=True)
  
         fv = px.bar(cotacao, x="data", y="volume", title="Volume diario (cotas)",
@@ -317,7 +353,7 @@ with tab3:
         fv.update_layout(height=200, margin=dict(t=40,b=20,l=10,r=10))
         st.plotly_chart(fv, use_container_width=True)
     else:
-        st.error("Nao foi possivel carregar a cotacao. Verifique sua conexao.")
+        st.error("Nao foi possivel carregar a cotacao.")
  
     st.subheader("Tabela de sensibilidade")
     sens = pd.DataFrame([
@@ -346,13 +382,13 @@ with tab4:
     base_mi  = df_st["Base Rk"].sum()  / 1000
     worst_mi = df_st["Worst Rk"].sum() / 1000
     pl_mi    = cvm["pl_total"] / 1e6
-    cotas    = cvm["cotas"]
+    cotas_n  = cvm["cotas"]
  
     k1,k2,k3,k4 = st.columns(4)
-    k1.metric("PL Contabil",  f"R$ {pl_mi:.1f} mi",      f"R$ {cvm['vp']:.2f}/cota")
-    k2.metric("PL Best",      f"R$ {best_mi:.1f} mi",    f"R$ {best_mi*1e6/cotas:.2f}/cota")
-    k3.metric("PL Base",      f"R$ {base_mi:.1f} mi",    f"R$ {base_mi*1e6/cotas:.2f}/cota")
-    k4.metric("PL Worst",     f"R$ {worst_mi:.1f} mi",   f"R$ {worst_mi*1e6/cotas:.2f}/cota", delta_color="inverse")
+    k1.metric("PL Contabil",  f"R$ {pl_mi:.1f} mi",     f"R$ {cvm['vp']:.2f}/cota")
+    k2.metric("PL Best",      f"R$ {best_mi:.1f} mi",   f"R$ {best_mi*1e6/cotas_n:.2f}/cota")
+    k3.metric("PL Base",      f"R$ {base_mi:.1f} mi",   f"R$ {base_mi*1e6/cotas_n:.2f}/cota")
+    k4.metric("PL Worst",     f"R$ {worst_mi:.1f} mi",  f"R$ {worst_mi*1e6/cotas_n:.2f}/cota", delta_color="inverse")
  
     fs = go.Figure()
     nomes = df_st["Ativo"].tolist()
