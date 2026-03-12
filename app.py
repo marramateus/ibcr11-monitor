@@ -1,6 +1,3 @@
- · PY
-Copy
-
 import streamlit as st
 import requests
 import pandas as pd
@@ -383,3 +380,4 @@ with tab4:
         "Mesmo no worst case o fundo nao quebra. "
         "Perfil: credito especial/distressed — nao e fundo conservador."
     )
+ 
