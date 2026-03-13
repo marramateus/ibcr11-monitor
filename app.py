@@ -97,7 +97,9 @@ def get_dados_cvm_mes(ano_mes: str) -> dict:
         tab_principal = max(tabelas_all.values(), key=lambda d: len(d))
 
     # Filtra pelo CNPJ
-    cnpj_col = next((c for c in tab_principal.columns if "CNPJ" in c and "FUNDO" in c), None)
+    cnpj_col = next((c for c in tab_principal.columns if "CNPJ" in c and ("FUNDO" in c or "CLASSE" in c)), None)
+    if not cnpj_col:
+        cnpj_col = next((c for c in tab_principal.columns if "CNPJ" in c), None)
     if not cnpj_col:
         raise ValueError(
             f"Coluna CNPJ_FUNDO nao encontrada.\n"
