@@ -54,11 +54,8 @@ def get_fundamentais():
     }
     r = requests.get(url, params=params, headers=headers, timeout=10)
     if r.status_code == 401:
-        raise ConnectionError(
-            "Yahoo Finance bloqueou acesso aos dados fundamentais (401).
-"
-            "VP e DY nao disponiveis sem autenticacao. Cotacao continua funcionando."
-        )
+        raise ConnectionError("Yahoo Finance bloqueou fundamentais (401). VP e DY indisponiveis.")
+
     r.raise_for_status()
     res2 = r.json()["quoteSummary"]["result"][0]
 
