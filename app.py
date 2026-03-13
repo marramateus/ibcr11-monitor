@@ -27,90 +27,131 @@ CRIS = [
 ICON = {"CRITICO": "🔴", "ATENCAO": "🟡", "NORMAL": "🟢"}
 COR  = {"CRITICO": "#E24B4A", "ATENCAO": "#EF9F27", "NORMAL": "#1D9E75"}
 
-# ── brapi.dev ─────────────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+    "Referer": "https://statusinvest.com.br/",
+}
+
+# ── Yahoo Finance: cotação + histórico ───────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
-def get_brapi(periodo: str):
-    token = st.secrets.get("BRAPI_TOKEN", "m2zRCkkvLEoVf4krF6Qtv5")
-    url   = f"https://brapi.dev/api/quote/{TICKER}"
-    params = {
-        "range":       periodo,
-        "interval":    "1d",
-        "fundamental": "true",
-        "dividends":   "true",
-        "token":       token,
-    }
-    r = requests.get(url, params=params, timeout=15)
+def get_cotacao(periodo: str):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}.SA?interval=1d&range={periodo}"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    r.raise_for_status()
+    result = r.json()["chart"]["result"]
+    if not result:
+        raise ValueError(f"Yahoo Finance sem dados para {TICKER}.SA")
+    d  = result[0]
+    df = pd.DataFrame({
+        "data":       [datetime.fromtimestamp(t).strftime("%Y-%m-%d") for t in d["timestamp"]],
+        "fechamento": d["indicators"]["quote"][0]["close"],
+        "volume":     d["indicators"]["quote"][0]["volume"],
+    }).dropna(subset=["fechamento"])
+    if df.empty:
+        raise ValueError("Serie de cotacoes vazia")
+    return df
+
+# ── Status Invest: VP, DY, P/VP, dividendos ──────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_status_invest():
+    url = f"https://statusinvest.com.br/fundos-imobiliarios/{TICKER.lower()}"
+    r   = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    def extrair(titulo):
+        """Busca bloco de indicador pelo titulo e retorna o valor."""
+        bloco = soup.find(lambda tag: tag.name in ["div","span"] and titulo.lower() in tag.get_text("", strip=True).lower())
+        if not bloco:
+            return None
+        # Valor fica no strong ou span.value dentro do bloco pai
+        pai = bloco.find_parent("div")
+        if pai:
+            strong = pai.find("strong")
+            if strong:
+                txt = strong.get_text(strip=True).replace("R$","").replace("%","").replace(".","").replace(",",".").strip()
+                try:
+                    return float(txt)
+                except:
+                    return txt
+        return None
+
+    # Tenta pegar dados via JSON embutido na página (mais confiavel que parsing HTML)
+    import re, json
+    scripts = soup.find_all("script")
+    dados_json = None
+    for s in scripts:
+        txt = s.string or ""
+        if "dy" in txt.lower() and "vpa" in txt.lower():
+            m = re.search(r'\{[^<]{200,}\}', txt)
+            if m:
+                try:
+                    dados_json = json.loads(m.group())
+                    break
+                except:
+                    pass
+
+    # Parsing direto dos blocos de indicadores
+    resultado = {}
+
+    # VP por cota (VPA)
+    for label in ["Valor Patrimonial", "VPA", "VP/Cota"]:
+        v = extrair(label)
+        if v:
+            resultado["vp"] = v
+            break
+
+    # P/VP
+    for label in ["P/VP", "P/VPA"]:
+        v = extrair(label)
+        if v:
+            resultado["pvp"] = v
+            break
+
+    # DY 12m
+    for label in ["DY (12M)", "Dividend Yield", "DY"]:
+        v = extrair(label)
+        if v:
+            resultado["dy_12m"] = v
+            break
+
+    # Ultimo dividendo
+    for label in ["Ultimo Rendimento", "Ultimo Dividendo", "Rendimento"]:
+        v = extrair(label)
+        if v:
+            resultado["ultimo_div"] = v
+            break
+
+    if not resultado:
+        # Dump para debug
+        titulos = [t.get_text(strip=True) for t in soup.find_all(["h3","h4","span","strong"])[:40]]
+        raise ValueError(f"Nenhum indicador extraido do Status Invest.\nTitulos encontrados: {titulos}")
+
+    return resultado
+
+# ── Dividendos históricos (Status Invest API interna) ────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_dividendos():
+    url = f"https://statusinvest.com.br/fii/companytickerprovents"
+    params = {"ticker": TICKER, "chartProventsType": 2}
+    r = requests.get(url, params=params, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=15)
     r.raise_for_status()
     data = r.json()
-
-    if "error" in data:
-        raise ValueError(f"brapi.dev erro: {data['error']}")
-    if not data.get("results"):
-        raise ValueError(f"brapi.dev retornou resultados vazios: {data}")
-
-    return data["results"][0]
-
-def parse_brapi(res):
-    """Extrai campos relevantes, levanta erro se campo critico ausente."""
-
-    def campo(chave, obrigatorio=True):
-        val = res.get(chave)
-        if val is None and obrigatorio:
-            raise KeyError(f"Campo '{chave}' ausente na resposta brapi. Campos disponiveis: {list(res.keys())}")
-        return val
-
-    vm = campo("regularMarketPrice")
-    vm_var_pct  = campo("regularMarketChangePercent", obrigatorio=False)
-    vm_var_abs  = campo("regularMarketChange",        obrigatorio=False)
-    volume      = campo("regularMarketVolume",        obrigatorio=False)
-    market_cap  = campo("marketCap",                  obrigatorio=False)
-
-    # Dados fundamentais (FII)
-    fund = res.get("summaryProfile") or {}
-    vp   = res.get("bookValue")           # VP/cota
-    pvp  = res.get("priceToBook")         # P/VP
-    dy   = res.get("dividendYield")       # DY 12m %
-
-    # Dividendos pagos
-    divs_raw = res.get("dividendsData", {}) or {}
-    divs_list = divs_raw.get("cashDividends", []) or []
-    df_divs = None
-    if divs_list:
-        df_divs = pd.DataFrame(divs_list)
-        if "paymentDate" in df_divs.columns:
-            df_divs["paymentDate"] = pd.to_datetime(df_divs["paymentDate"], errors="coerce")
-            df_divs = df_divs.sort_values("paymentDate", ascending=False)
-
-    # Historico de precos
-    hist_raw = res.get("historicalDataPrice", []) or []
-    df_hist  = None
-    if hist_raw:
-        df_hist = pd.DataFrame(hist_raw)
-        if "date" in df_hist.columns:
-            df_hist["data"] = pd.to_datetime(df_hist["date"], unit="s").dt.strftime("%Y-%m-%d")
-        df_hist = df_hist.dropna(subset=["close"])
-
-    return {
-        "vm":         vm,
-        "vm_var_pct": vm_var_pct,
-        "vm_var_abs": vm_var_abs,
-        "volume":     volume,
-        "market_cap": market_cap,
-        "vp":         vp,
-        "pvp":        pvp,
-        "dy_12m":     dy,
-        "df_divs":    df_divs,
-        "df_hist":    df_hist,
-    }
+    if not data or "assetEarningsModels" not in data:
+        raise ValueError(f"Status Invest dividendos: resposta inesperada: {str(data)[:200]}")
+    rows = data["assetEarningsModels"]
+    if not rows:
+        raise ValueError("Status Invest: lista de dividendos vazia")
+    df = pd.DataFrame(rows)
+    return df
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Periodo")
-    periodo_graf = st.select_slider(
-        "Historico B3",
-        options=["1mo","3mo","6mo","1y","2y","5y"],
-        value="3mo"
-    )
+    periodo_graf = st.select_slider("Historico B3",
+                                    options=["1mo","3mo","6mo","1y","2y","5y"],
+                                    value="3mo")
     st.divider()
     api_key = st.text_input("Anthropic API Key (opcional)", type="password")
     filtro  = st.multiselect("Filtrar CRIs", ["CRITICO","ATENCAO","NORMAL"],
@@ -119,47 +160,59 @@ with st.sidebar:
     if st.button("Atualizar dados"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Fonte: brapi.dev (B3 + CVM)")
+    st.caption("Fontes: Yahoo Finance + Status Invest")
 
 # ── Carrega dados ─────────────────────────────────────────────────────────────
 st.title("IBCR11 — Monitor de CRIs")
 
-brapi_ok, dados, brapi_erro = False, None, None
+cot_ok, cotacao, cot_erro = False, None, None
 try:
-    with st.spinner("Carregando dados (brapi.dev)..."):
-        res   = get_brapi(periodo_graf)
-        dados = parse_brapi(res)
-    brapi_ok = True
+    with st.spinner("Carregando cotacao (Yahoo Finance)..."):
+        cotacao = get_cotacao(periodo_graf)
+    cot_ok = True
 except Exception as e:
-    brapi_erro = str(e)
+    cot_erro = str(e)
+
+si_ok, si, si_erro = False, None, None
+try:
+    with st.spinner("Carregando fundamentais (Status Invest)..."):
+        si = get_status_invest()
+    si_ok = True
+except Exception as e:
+    si_erro = str(e)
+
+div_ok, df_divs, div_erro = False, None, None
+try:
+    with st.spinner("Carregando dividendos (Status Invest)..."):
+        df_divs = get_dividendos()
+    div_ok = True
+except Exception as e:
+    div_erro = str(e)
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
-if brapi_ok:
-    vm      = dados["vm"]
-    vp      = dados["vp"]
-    pvp     = dados["pvp"]
-    dy_12m  = dados["dy_12m"]
-    desagio = round((1 - vm / vp) * 100, 2) if vp else None
+vm  = cotacao.iloc[-1]["fechamento"] if cot_ok else None
+vp  = si.get("vp")  if si_ok else None
+pvp = si.get("pvp") if si_ok else None
+dy  = si.get("dy_12m") if si_ok else None
+desagio = round((1 - vm / vp) * 100, 2) if vm and vp else None
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("VM/cota (B3)",
-              f"R$ {vm:.2f}",
-              f"{dados['vm_var_pct']:+.2f}%" if dados['vm_var_pct'] else None)
-    c2.metric("VP/cota",
-              f"R$ {vp:.2f}" if vp else "—",
-              help="bookValue via brapi.dev")
-    c3.metric("P/VP",
-              f"{pvp:.2f}x" if pvp else "—")
-    c4.metric("Desagio VM/VP",
-              f"{desagio:.1f}%" if desagio else "—",
-              delta_color="inverse")
-    c5.metric("DY 12m",
-              f"{dy_12m:.2f}%" if dy_12m else "—")
+c1,c2,c3,c4,c5 = st.columns(5)
+c1.metric("VM/cota (B3)",  f"R$ {vm:.2f}"       if vm      else "— erro Yahoo",  help="Yahoo Finance, 15min delay")
+c2.metric("VP/cota",       f"R$ {vp:.2f}"        if vp      else "— erro SI",    help="Status Invest")
+c3.metric("P/VP",          f"{pvp:.2f}x"          if pvp     else "— erro SI")
+c4.metric("Desagio VM/VP", f"{desagio:.1f}%"      if desagio else "—",            delta_color="inverse")
+c5.metric("DY 12m",        f"{dy:.2f}%"           if dy      else "— erro SI")
 
-    if dados["market_cap"]:
-        st.caption(f"Market Cap: R$ {dados['market_cap']/1e6:.1f} mi  |  Volume: {int(dados['volume']):,} cotas" if dados["volume"] else f"Market Cap: R$ {dados['market_cap']/1e6:.1f} mi")
-else:
-    st.error(f"brapi.dev indisponivel:\n```\n{brapi_erro}\n```")
+erros = []
+if not cot_ok: erros.append(f"Yahoo Finance: {cot_erro}")
+if not si_ok:  erros.append(f"Status Invest (fundamentais): {si_erro}")
+if not div_ok: erros.append(f"Status Invest (dividendos): {div_erro}")
+if erros:
+    with st.expander("⚠️ Erros de carregamento"):
+        for e in erros:
+            st.error(e)
+
+if not cot_ok and not si_ok:
     st.stop()
 
 st.divider()
@@ -215,7 +268,6 @@ with tab2:
                            format_func=lambda x: f"{ICON[next(c['status'] for c in CRIS if c['nome']==x)]} {x}")
     cri_obj = next(c for c in CRIS if c["nome"] == cri_sel)
     query   = st.text_input("Query (editavel)", value=cri_obj["query"])
-
     b1, b2, _ = st.columns([1,1,5])
     btn1 = b1.button("Buscar este", type="primary")
     btn2 = b2.button("Buscar todos")
@@ -293,12 +345,18 @@ with tab3:
     label_p = {"1mo":"1 mes","3mo":"3 meses","6mo":"6 meses","1y":"1 ano","2y":"2 anos","5y":"5 anos"}
     st.subheader(f"Cotacao IBCR11 — {label_p.get(periodo_graf, periodo_graf)}")
 
-    df_hist = dados["df_hist"]
-    if df_hist is None or df_hist.empty:
-        st.error("Historico de precos indisponivel na resposta brapi.dev")
+    if not cot_ok:
+        st.error(f"Cotacao indisponivel: {cot_erro}")
     else:
+        u = cotacao.iloc[-1]
+        m1,m2,m3 = st.columns(3)
+        m1.metric("Ultimo fechamento",    f"R$ {u['fechamento']:.2f}")
+        m2.metric("Volume ultimo pregao", f"{int(u['volume']):,}" if pd.notna(u["volume"]) else "—")
+        m3.metric("Desagio sobre VP",     f"{desagio:.1f}%" if desagio else "— VP indisponivel",
+                  delta_color="inverse")
+
         fc = go.Figure()
-        fc.add_trace(go.Scatter(x=df_hist["data"], y=df_hist["close"],
+        fc.add_trace(go.Scatter(x=cotacao["data"], y=cotacao["fechamento"],
                                 mode="lines", name="Fechamento",
                                 line=dict(color="#378ADD", width=2)))
         if vp:
@@ -307,27 +365,29 @@ with tab3:
         fc.update_layout(height=380, yaxis_title="R$", margin=dict(t=20,b=20,l=10,r=120))
         st.plotly_chart(fc, use_container_width=True)
 
-        if "volume" in df_hist.columns:
-            fv = px.bar(df_hist, x="data", y="volume", title="Volume diario",
-                        color_discrete_sequence=["#9FE1CB"])
-            fv.update_layout(height=200, margin=dict(t=40,b=20,l=10,r=10))
-            st.plotly_chart(fv, use_container_width=True)
+        fv = px.bar(cotacao, x="data", y="volume", title="Volume diario",
+                    color_discrete_sequence=["#9FE1CB"])
+        fv.update_layout(height=200, margin=dict(t=40,b=20,l=10,r=10))
+        st.plotly_chart(fv, use_container_width=True)
 
     st.divider()
-    st.subheader("Historico de dividendos pagos")
-    df_divs = dados["df_divs"]
-    if df_divs is None or df_divs.empty:
-        st.warning("Sem historico de dividendos na resposta brapi.dev")
+    st.subheader("Historico de dividendos")
+    if not div_ok:
+        st.error(f"Dividendos indisponiveis: {div_erro}")
     else:
-        cols_show = [c for c in ["paymentDate","rate","relatedTo","label"] if c in df_divs.columns]
-        st.dataframe(df_divs[cols_show].head(24), use_container_width=True, hide_index=True)
+        cols_show = [c for c in ["ed","etd","sv","sv","ldt"] if c in df_divs.columns]
+        rename = {"ed": "Data Ex", "etd": "Data Pagamento", "sv": "Valor (R$)", "ldt": "Data Limite"}
+        df_show = df_divs.rename(columns=rename)
+        st.dataframe(df_show.head(24), use_container_width=True, hide_index=True)
 
-        if "paymentDate" in df_divs.columns and "rate" in df_divs.columns:
-            df_plot = df_divs.dropna(subset=["paymentDate","rate"]).copy()
-            df_plot["rate"] = pd.to_numeric(df_plot["rate"], errors="coerce")
-            df_plot = df_plot.sort_values("paymentDate")
-            fd = px.bar(df_plot, x="paymentDate", y="rate",
-                        title="Dividendo pago por mes (R$/cota)",
+        val_col = next((c for c in df_divs.columns if c in ["sv","value","v"]), None)
+        dt_col  = next((c for c in df_divs.columns if c in ["ed","pd","etd"]), None)
+        if val_col and dt_col:
+            df_plot = df_divs[[dt_col, val_col]].copy()
+            df_plot[val_col] = pd.to_numeric(df_plot[val_col], errors="coerce")
+            df_plot[dt_col]  = pd.to_datetime(df_plot[dt_col], errors="coerce")
+            df_plot = df_plot.dropna().sort_values(dt_col)
+            fd = px.bar(df_plot, x=dt_col, y=val_col, title="Dividendo pago (R$/cota)",
                         color_discrete_sequence=["#1D9E75"])
             fd.update_layout(height=250, margin=dict(t=40,b=20,l=10,r=10))
             st.plotly_chart(fd, use_container_width=True)
@@ -351,10 +411,10 @@ with tab4:
     worst_mi = df_st["Worst Rk"].sum() / 1000
 
     k1,k2,k3,k4 = st.columns(4)
-    k1.metric("VM atual (B3)",  f"R$ {vm:.2f}",           help="brapi.dev — tempo real")
-    k2.metric("PL Best",        f"R$ {best_mi:.1f} mi")
-    k3.metric("PL Base",        f"R$ {base_mi:.1f} mi")
-    k4.metric("PL Worst",       f"R$ {worst_mi:.1f} mi",  delta_color="inverse")
+    k1.metric("VM atual",   f"R$ {vm:.2f}"        if vm else "—")
+    k2.metric("PL Best",    f"R$ {best_mi:.1f} mi")
+    k3.metric("PL Base",    f"R$ {base_mi:.1f} mi")
+    k4.metric("PL Worst",   f"R$ {worst_mi:.1f} mi", delta_color="inverse")
 
     fs = go.Figure()
     nomes = df_st["Ativo"].tolist()
@@ -367,7 +427,8 @@ with tab4:
     st.dataframe(df_st, use_container_width=True, hide_index=True)
 
     st.subheader("IRR esperado")
-    st.caption(f"Referencia: R$ {vm:.2f}/cota (ultimo fechamento B3)")
+    if vm:
+        st.caption(f"Referencia: R$ {vm:.2f}/cota (ultimo fechamento B3)")
     irr = pd.DataFrame([
         ("Positivo", "CRVO + Olimpo resolvidos",         "~20%",       "~R$73/cota", "+49%", "34-38%"),
         ("Base",     "Mercado aceita VP ajustado",        "~25-30%",    "~R$61/cota", "+25%", "23-26%"),
@@ -375,4 +436,4 @@ with tab4:
         ("Stress",   "Worst case, desagio se mantem 30%", "~30% s/ VP", "~R$40/cota", "-18%", "~0-3%"),
     ], columns=["Cenario","Hipotese","Desagio Final","VM em 24M","Ganho Capital","IRR a.a."])
     st.dataframe(irr, use_container_width=True, hide_index=True)
-    st.caption("Cenarios de IRR: estimativa BREI jan/2026. Atualizar manualmente apos novo relatorio.")
+    st.caption("Cenarios de IRR: estimativa BREI jan/2026.")
