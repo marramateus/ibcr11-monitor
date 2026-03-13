@@ -1,8 +1,6 @@
 import streamlit as st
 import requests
 import pandas as pd
-import zipfile
-import io
 from datetime import datetime, date
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
@@ -10,8 +8,7 @@ import plotly.express as px
 
 st.set_page_config(page_title="IBCR11 Monitor", page_icon="📊", layout="wide")
 
-CNPJ_IBCR11 = "14744231000114"
-TICKER      = "IBCR11.SA"
+TICKER = "IBCR11"
 
 CRIS = [
     {"nome": "CRI CRVO",       "status": "CRITICO",  "pl": 27.3, "taxa": "IPCA+7,00%",    "venc": "jun/2036",         "sec": "Virgo", "r_best": 80,  "r_base": 55,  "r_worst": 40,  "htmk": 23191.7, "uf": "RS", "tipo": "BTS",        "query": "CRVO Macromix Sao Leopoldo inadimplencia"},
@@ -30,240 +27,149 @@ CRIS = [
 ICON = {"CRITICO": "🔴", "ATENCAO": "🟡", "NORMAL": "🟢"}
 COR  = {"CRITICO": "#E24B4A", "ATENCAO": "#EF9F27", "NORMAL": "#1D9E75"}
 
-def gerar_meses():
-    inicio = date(2021, 6, 1)
-    hoje   = date.today()
-    meses  = []
-    d = date(inicio.year, inicio.month, 1)
-    while d <= date(hoje.year, hoje.month, 1):
-        meses.append(d.strftime("%Y-%m"))
-        d = date(d.year + (d.month // 12), (d.month % 12) + 1, 1)
-    return list(reversed(meses))
-
-MESES  = gerar_meses()
-LABELS = {m: datetime.strptime(m, "%Y-%m").strftime("%b/%Y").lower() for m in MESES}
-
-# ── CVM: baixa ZIP e extrai tabela geral ─────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def carregar_zip_cvm(ano: int) -> dict:
-    """
-    Baixa inf_mensal_fii_{ano}.zip e retorna dict {nome_arquivo: DataFrame}.
-    O ZIP contém varios CSVs (tab_I, tab_II, etc).
-    """
-    url = f"https://dados.cvm.gov.br/dados/FII/DOC/INF_MENSAL/DADOS/inf_mensal_fii_{ano}.zip"
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    if r.status_code == 404:
-        raise FileNotFoundError(f"ZIP {ano} nao encontrado na CVM (HTTP 404). URL: {url}")
+# ── brapi.dev ─────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=900, show_spinner=False)
+def get_brapi(periodo: str):
+    token = st.secrets["BRAPI_TOKEN"]
+    url   = f"https://brapi.dev/api/quote/{TICKER}"
+    params = {
+        "range":       periodo,
+        "interval":    "1d",
+        "fundamental": "true",
+        "dividends":   "true",
+        "token":       token,
+    }
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
+    data = r.json()
 
-    tabelas = {}
-    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        for nome in z.namelist():
-            if nome.endswith(".csv"):
-                with z.open(nome) as f:
-                    df = pd.read_csv(f, sep=";", encoding="latin1", dtype=str)
-                    df.columns = df.columns.str.strip().str.upper()
-                    tabelas[nome] = df
-    if not tabelas:
-        raise ValueError(f"ZIP {ano} nao contem CSVs. Arquivos: {z.namelist()}")
-    return tabelas
+    if "error" in data:
+        raise ValueError(f"brapi.dev erro: {data['error']}")
+    if not data.get("results"):
+        raise ValueError(f"brapi.dev retornou resultados vazios: {data}")
 
-def get_dados_cvm_mes(ano_mes: str) -> dict:
-    ano   = int(ano_mes[:4])
-    label = LABELS.get(ano_mes, ano_mes)
-    erros = []
+    return data["results"][0]
 
-    # Tenta ano atual e anterior (dados de jan/26 podem estar no zip de 2025)
-    anos_tentar = [ano] if ano < date.today().year else [ano, ano - 1]
-    tabelas_all = {}
-    for a in anos_tentar:
-        try:
-            tabelas_all.update(carregar_zip_cvm(a))
-        except Exception as e:
-            erros.append(str(e))
+def parse_brapi(res):
+    """Extrai campos relevantes, levanta erro se campo critico ausente."""
 
-    if not tabelas_all:
-        raise ConnectionError(f"Nao foi possivel carregar dados da CVM:\n" + "\n".join(erros))
+    def campo(chave, obrigatorio=True):
+        val = res.get(chave)
+        if val is None and obrigatorio:
+            raise KeyError(f"Campo '{chave}' ausente na resposta brapi. Campos disponiveis: {list(res.keys())}")
+        return val
 
-    # Procura IBCR11 em TODAS as tabelas do ZIP
-    df_fii    = None
-    tab_usada = None
-    cnpj_col  = None
-    tentativas = []
+    vm = campo("regularMarketPrice")
+    vm_var_pct  = campo("regularMarketChangePercent", obrigatorio=False)
+    vm_var_abs  = campo("regularMarketChange",        obrigatorio=False)
+    volume      = campo("regularMarketVolume",        obrigatorio=False)
+    market_cap  = campo("marketCap",                  obrigatorio=False)
 
-    for nome_tab, df in tabelas_all.items():
-        col = next((c for c in df.columns if "CNPJ" in c), None)
-        if col is None:
-            tentativas.append(f"{nome_tab}: sem coluna CNPJ")
-            continue
-        mask = df[col].str.replace(r"\D", "", regex=True) == CNPJ_IBCR11
-        if mask.any():
-            df_fii    = df[mask].copy()
-            tab_usada = nome_tab
-            cnpj_col  = col
-            break
-        else:
-            tentativas.append(f"{nome_tab} (col={col}): nao encontrado, ex={df[col].head(2).tolist()}")
+    # Dados fundamentais (FII)
+    fund = res.get("summaryProfile") or {}
+    vp   = res.get("bookValue")           # VP/cota
+    pvp  = res.get("priceToBook")         # P/VP
+    dy   = res.get("dividendYield")       # DY 12m %
 
-    if df_fii is None or df_fii.empty:
-        raise ValueError(
-            f"IBCR11 (CNPJ {CNPJ_IBCR11}) nao encontrado em nenhuma tabela.\n"
-            f"Tabelas verificadas:\n" + "\n".join(tentativas)
-        )
+    # Dividendos pagos
+    divs_raw = res.get("dividendsData", {}) or {}
+    divs_list = divs_raw.get("cashDividends", []) or []
+    df_divs = None
+    if divs_list:
+        df_divs = pd.DataFrame(divs_list)
+        if "paymentDate" in df_divs.columns:
+            df_divs["paymentDate"] = pd.to_datetime(df_divs["paymentDate"], errors="coerce")
+            df_divs = df_divs.sort_values("paymentDate", ascending=False)
 
-
-    # Filtra pelo mes
-    data_col = next((c for c in df_fii.columns if any(x in c for x in ["COMPET", "DT_REF", "DATA", "REFERENCIA"])), None)
-    if not data_col:
-        raise ValueError(
-            f"Coluna de competencia nao encontrada.\n"
-            f"Colunas: {list(df_fii.columns)}"
-        )
-
-    df_fii["_mes"] = pd.to_datetime(df_fii[data_col], errors="coerce").dt.strftime("%Y-%m")
-    df_mes = df_fii[df_fii["_mes"] == ano_mes]
-
-    if df_mes.empty:
-        meses_disp = sorted(df_fii["_mes"].dropna().unique().tolist())
-        raise ValueError(
-            f"Sem dado para {label}.\n"
-            f"Meses disponiveis no arquivo: {meses_disp}"
-        )
-
-    row = df_mes.sort_values(data_col).iloc[-1]
-
-    def v(chaves, obrigatorio=True):
-        """Busca campo por lista de possiveis nomes parciais."""
-        if isinstance(chaves, str):
-            chaves = [chaves]
-        col = next((c for c in df_mes.columns for k in chaves if k in c), None)
-        if col is None:
-            if obrigatorio:
-                raise KeyError(
-                    f"Nenhum dos campos {chaves} encontrado.\n"
-                    f"Campos numericos disponiveis: {[c for c in df_mes.columns if any(x in c for x in ['VL','NR','QT','TX'])]}"
-                )
-            return None
-        raw = str(row[col]).replace(",", ".").strip()
-        if raw in ("", "nan", "None", "-"):
-            if obrigatorio:
-                raise ValueError(f"Campo {col} esta vazio para {label}")
-            return None
-        return float(raw)
-
-    vp        = v(["VL_PATRIM_COTA", "PATRIM_COTA", "VL_COTA"])
-    pl        = v(["VL_PATRIM_LIQ",  "PATRIM_LIQ",  "VL_PL"])
-    cotas     = v(["NR_COTAS_EMIT",  "NR_COTAS",    "QT_COTAS"])
-    dividendo = v(["VL_RENDIMENTO",  "VL_DISTRIB",  "RENDIMENTO"], obrigatorio=False)
-    cotistas  = v(["NR_COTST",       "NR_COTISTAS"], obrigatorio=False)
-
-    dy = round(dividendo / vp * 100, 4) if vp and dividendo else None
+    # Historico de precos
+    hist_raw = res.get("historicalDataPrice", []) or []
+    df_hist  = None
+    if hist_raw:
+        df_hist = pd.DataFrame(hist_raw)
+        if "date" in df_hist.columns:
+            df_hist["data"] = pd.to_datetime(df_hist["date"], unit="s").dt.strftime("%Y-%m-%d")
+        df_hist = df_hist.dropna(subset=["close"])
 
     return {
-        "vp": vp,
-        "pl_total": pl,
-        "cotas": int(cotas),
-        "dividendo_cota": dividendo,
-        "dy_mensal": dy,
-        "cotistas": int(cotistas) if cotistas else None,
-        "competencia": ano_mes,
-        "label": label,
-        "colunas_encontradas": {
-            "vp": next((c for c in df_mes.columns if any(x in c for x in ["VL_PATRIM_COTA","PATRIM_COTA","VL_COTA"])), "?"),
-            "pl": next((c for c in df_mes.columns if any(x in c for x in ["VL_PATRIM_LIQ","PATRIM_LIQ","VL_PL"])), "?"),
-        }
+        "vm":         vm,
+        "vm_var_pct": vm_var_pct,
+        "vm_var_abs": vm_var_abs,
+        "volume":     volume,
+        "market_cap": market_cap,
+        "vp":         vp,
+        "pvp":        pvp,
+        "dy_12m":     dy,
+        "df_divs":    df_divs,
+        "df_hist":    df_hist,
     }
-
-# ── Yahoo Finance ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=900, show_spinner=False)
-def get_cotacao(periodo: str):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}?interval=1d&range={periodo}"
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    r.raise_for_status()
-    result = r.json()["chart"]["result"]
-    if not result:
-        raise ValueError(f"Yahoo Finance sem dados para {TICKER}")
-    d  = result[0]
-    df = pd.DataFrame({
-        "data":       [datetime.fromtimestamp(t).strftime("%Y-%m-%d") for t in d["timestamp"]],
-        "fechamento": d["indicators"]["quote"][0]["close"],
-        "volume":     d["indicators"]["quote"][0]["volume"],
-    }).dropna(subset=["fechamento"])
-    if df.empty:
-        raise ValueError("Serie de cotacoes vazia")
-    return df
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Periodo")
-    mes_sel      = st.selectbox("Mes/Ano (CVM)", MESES, format_func=lambda m: LABELS[m], index=0)
-    periodo_graf = st.select_slider("Historico B3", options=["1mo","3mo","6mo","1y","2y","5y"], value="3mo")
+    periodo_graf = st.select_slider(
+        "Historico B3",
+        options=["1mo","3mo","6mo","1y","2y","5y"],
+        value="3mo"
+    )
     st.divider()
     api_key = st.text_input("Anthropic API Key (opcional)", type="password")
     filtro  = st.multiselect("Filtrar CRIs", ["CRITICO","ATENCAO","NORMAL"],
                              default=["CRITICO","ATENCAO","NORMAL"])
     st.divider()
-    if st.button("Limpar cache"):
+    if st.button("Atualizar dados"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Fonte: CVM (inf. mensal FII) + Yahoo Finance")
+    st.caption("Fonte: brapi.dev (B3 + CVM)")
 
 # ── Carrega dados ─────────────────────────────────────────────────────────────
 st.title("IBCR11 — Monitor de CRIs")
 
-cvm_ok, cvm, cvm_erro = False, None, None
+brapi_ok, dados, brapi_erro = False, None, None
 try:
-    with st.spinner(f"Carregando CVM ({LABELS[mes_sel]})..."):
-        cvm = get_dados_cvm_mes(mes_sel)
-    cvm_ok = True
+    with st.spinner("Carregando dados (brapi.dev)..."):
+        res   = get_brapi(periodo_graf)
+        dados = parse_brapi(res)
+    brapi_ok = True
 except Exception as e:
-    cvm_erro = str(e)
-
-cot_ok, cotacao, cot_erro = False, None, None
-try:
-    with st.spinner("Carregando cotacao B3..."):
-        cotacao = get_cotacao(periodo_graf)
-    cot_ok = True
-except Exception as e:
-    cot_erro = str(e)
+    brapi_erro = str(e)
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
-if cvm_ok and cot_ok:
-    vm      = cotacao.iloc[-1]["fechamento"]
-    desagio = round((1 - vm / cvm["vp"]) * 100, 2)
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("VP/cota",       f"R$ {cvm['vp']:.2f}",             help=f"CVM — {cvm['label']}")
-    c2.metric("VM/cota (B3)",  f"R$ {vm:.2f}",                    help="Yahoo Finance, 15min delay")
-    c3.metric("Desagio VM/VP", f"{desagio:.2f}%",                  delta_color="inverse")
-    c4.metric("DY Mensal",     f"{cvm['dy_mensal']:.2f}%" if cvm['dy_mensal'] else "—",
-              help=f"Dividendo R${cvm['dividendo_cota']:.2f}/cota" if cvm['dividendo_cota'] else "sem dado")
-    st.caption(
-        f"CVM {cvm['label']} | PL: R$ {cvm['pl_total']/1e6:.1f} mi | {cvm['cotas']:,} cotas"
-        + (f" | {cvm['cotistas']:,} cotistas" if cvm.get('cotistas') else "")
-    )
-elif cvm_ok:
-    c1,c2,c3 = st.columns(3)
-    c1.metric("VP/cota",   f"R$ {cvm['vp']:.2f}")
-    c2.metric("DY Mensal", f"{cvm['dy_mensal']:.2f}%" if cvm['dy_mensal'] else "—")
-    c3.metric("PL",        f"R$ {cvm['pl_total']/1e6:.1f} mi")
-    st.error(f"Cotacao B3 indisponivel: {cot_erro}")
-elif cot_ok:
-    vm = cotacao.iloc[-1]["fechamento"]
-    st.metric("VM/cota (B3)", f"R$ {vm:.2f}")
-    st.error(f"CVM indisponivel:\n```\n{cvm_erro}\n```")
+if brapi_ok:
+    vm      = dados["vm"]
+    vp      = dados["vp"]
+    pvp     = dados["pvp"]
+    dy_12m  = dados["dy_12m"]
+    desagio = round((1 - vm / vp) * 100, 2) if vp else None
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("VM/cota (B3)",
+              f"R$ {vm:.2f}",
+              f"{dados['vm_var_pct']:+.2f}%" if dados['vm_var_pct'] else None)
+    c2.metric("VP/cota",
+              f"R$ {vp:.2f}" if vp else "—",
+              help="bookValue via brapi.dev")
+    c3.metric("P/VP",
+              f"{pvp:.2f}x" if pvp else "—")
+    c4.metric("Desagio VM/VP",
+              f"{desagio:.1f}%" if desagio else "—",
+              delta_color="inverse")
+    c5.metric("DY 12m",
+              f"{dy_12m:.2f}%" if dy_12m else "—")
+
+    if dados["market_cap"]:
+        st.caption(f"Market Cap: R$ {dados['market_cap']/1e6:.1f} mi  |  Volume: {int(dados['volume']):,} cotas" if dados["volume"] else f"Market Cap: R$ {dados['market_cap']/1e6:.1f} mi")
 else:
-    st.error(f"Todas as fontes falharam.\n\n**CVM:** {cvm_erro}\n\n**Yahoo:** {cot_erro}")
+    st.error(f"brapi.dev indisponivel:\n```\n{brapi_erro}\n```")
     st.stop()
 
 st.divider()
-
-tab1, tab2, tab3, tab4 = st.tabs(["Carteira", "Monitorar CRIs", "Cotacao", "Stress Test"])
+tab1, tab2, tab3, tab4 = st.tabs(["Carteira", "Monitorar CRIs", "Cotacao & Dividendos", "Stress Test"])
 
 # ── TAB 1 ─────────────────────────────────────────────────────────────────────
 with tab1:
     cris_f = [c for c in CRIS if c["status"] in filtro]
     if not cris_f:
-        st.warning("Nenhum CRI — ajuste o filtro.")
+        st.warning("Nenhum CRI selecionado.")
     else:
         col_a, col_b = st.columns(2)
         with col_a:
@@ -315,7 +221,7 @@ with tab2:
     btn2 = b2.button("Buscar todos")
 
     def buscar_rss(q, url):
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=10)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         r.raise_for_status()
         soup  = BeautifulSoup(r.content, "html.parser")
         items = soup.find_all("item")
@@ -387,33 +293,44 @@ with tab3:
     label_p = {"1mo":"1 mes","3mo":"3 meses","6mo":"6 meses","1y":"1 ano","2y":"2 anos","5y":"5 anos"}
     st.subheader(f"Cotacao IBCR11 — {label_p.get(periodo_graf, periodo_graf)}")
 
-    if not cot_ok:
-        st.error(f"Cotacao indisponivel:\n```\n{cot_erro}\n```")
+    df_hist = dados["df_hist"]
+    if df_hist is None or df_hist.empty:
+        st.error("Historico de precos indisponivel na resposta brapi.dev")
     else:
-        u = cotacao.iloc[-1]
-        m1,m2,m3 = st.columns(3)
-        m1.metric("Ultimo fechamento",    f"R$ {u['fechamento']:.2f}")
-        m2.metric("Volume ultimo pregao", f"{int(u['volume']):,}" if pd.notna(u["volume"]) else "—")
-        if cvm_ok:
-            m3.metric("Desagio sobre VP", f"{(1 - u['fechamento']/cvm['vp'])*100:.1f}%",
-                      delta_color="inverse", help=f"VP CVM {cvm['label']}")
-        else:
-            m3.metric("Desagio sobre VP", "— VP indisponivel")
-
         fc = go.Figure()
-        fc.add_trace(go.Scatter(x=cotacao["data"], y=cotacao["fechamento"],
+        fc.add_trace(go.Scatter(x=df_hist["data"], y=df_hist["close"],
                                 mode="lines", name="Fechamento",
                                 line=dict(color="#378ADD", width=2)))
-        if cvm_ok:
-            fc.add_hline(y=cvm["vp"], line_dash="dash", line_color="#E24B4A",
-                         annotation_text=f"VP {cvm['label']} R${cvm['vp']:.2f}")
-        fc.update_layout(height=380, yaxis_title="R$", margin=dict(t=20,b=20,l=10,r=130))
+        if vp:
+            fc.add_hline(y=vp, line_dash="dash", line_color="#E24B4A",
+                         annotation_text=f"VP R${vp:.2f}")
+        fc.update_layout(height=380, yaxis_title="R$", margin=dict(t=20,b=20,l=10,r=120))
         st.plotly_chart(fc, use_container_width=True)
 
-        fv = px.bar(cotacao, x="data", y="volume", title="Volume diario (cotas)",
-                    color_discrete_sequence=["#9FE1CB"])
-        fv.update_layout(height=200, margin=dict(t=40,b=20,l=10,r=10))
-        st.plotly_chart(fv, use_container_width=True)
+        if "volume" in df_hist.columns:
+            fv = px.bar(df_hist, x="data", y="volume", title="Volume diario",
+                        color_discrete_sequence=["#9FE1CB"])
+            fv.update_layout(height=200, margin=dict(t=40,b=20,l=10,r=10))
+            st.plotly_chart(fv, use_container_width=True)
+
+    st.divider()
+    st.subheader("Historico de dividendos pagos")
+    df_divs = dados["df_divs"]
+    if df_divs is None or df_divs.empty:
+        st.warning("Sem historico de dividendos na resposta brapi.dev")
+    else:
+        cols_show = [c for c in ["paymentDate","rate","relatedTo","label"] if c in df_divs.columns]
+        st.dataframe(df_divs[cols_show].head(24), use_container_width=True, hide_index=True)
+
+        if "paymentDate" in df_divs.columns and "rate" in df_divs.columns:
+            df_plot = df_divs.dropna(subset=["paymentDate","rate"]).copy()
+            df_plot["rate"] = pd.to_numeric(df_plot["rate"], errors="coerce")
+            df_plot = df_plot.sort_values("paymentDate")
+            fd = px.bar(df_plot, x="paymentDate", y="rate",
+                        title="Dividendo pago por mes (R$/cota)",
+                        color_discrete_sequence=["#1D9E75"])
+            fd.update_layout(height=250, margin=dict(t=40,b=20,l=10,r=10))
+            st.plotly_chart(fd, use_container_width=True)
 
 # ── TAB 4 ─────────────────────────────────────────────────────────────────────
 with tab4:
@@ -433,20 +350,11 @@ with tab4:
     base_mi  = df_st["Base Rk"].sum()  / 1000
     worst_mi = df_st["Worst Rk"].sum() / 1000
 
-    if cvm_ok:
-        pl_mi   = cvm["pl_total"] / 1e6
-        cotas_n = cvm["cotas"]
-        k1,k2,k3,k4 = st.columns(4)
-        k1.metric("PL Contabil", f"R$ {pl_mi:.1f} mi",    f"R$ {cvm['vp']:.2f}/cota ({cvm['label']})")
-        k2.metric("PL Best",     f"R$ {best_mi:.1f} mi",  f"R$ {best_mi*1e6/cotas_n:.2f}/cota")
-        k3.metric("PL Base",     f"R$ {base_mi:.1f} mi",  f"R$ {base_mi*1e6/cotas_n:.2f}/cota")
-        k4.metric("PL Worst",    f"R$ {worst_mi:.1f} mi", f"R$ {worst_mi*1e6/cotas_n:.2f}/cota", delta_color="inverse")
-    else:
-        st.error(f"PL/VP indisponivel: {cvm_erro}")
-        k1,k2,k3 = st.columns(3)
-        k1.metric("PL Best",  f"R$ {best_mi:.1f} mi")
-        k2.metric("PL Base",  f"R$ {base_mi:.1f} mi")
-        k3.metric("PL Worst", f"R$ {worst_mi:.1f} mi", delta_color="inverse")
+    k1,k2,k3,k4 = st.columns(4)
+    k1.metric("VM atual (B3)",  f"R$ {vm:.2f}",           help="brapi.dev — tempo real")
+    k2.metric("PL Best",        f"R$ {best_mi:.1f} mi")
+    k3.metric("PL Base",        f"R$ {base_mi:.1f} mi")
+    k4.metric("PL Worst",       f"R$ {worst_mi:.1f} mi",  delta_color="inverse")
 
     fs = go.Figure()
     nomes = df_st["Ativo"].tolist()
@@ -458,9 +366,8 @@ with tab4:
     st.plotly_chart(fs, use_container_width=True)
     st.dataframe(df_st, use_container_width=True, hide_index=True)
 
-    st.subheader("IRR esperado — comprado a VM atual")
-    if cot_ok:
-        st.caption(f"Referencia: R$ {cotacao.iloc[-1]['fechamento']:.2f}/cota (ultimo fechamento B3)")
+    st.subheader("IRR esperado")
+    st.caption(f"Referencia: R$ {vm:.2f}/cota (ultimo fechamento B3)")
     irr = pd.DataFrame([
         ("Positivo", "CRVO + Olimpo resolvidos",         "~20%",       "~R$73/cota", "+49%", "34-38%"),
         ("Base",     "Mercado aceita VP ajustado",        "~25-30%",    "~R$61/cota", "+25%", "23-26%"),
