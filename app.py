@@ -39,6 +39,88 @@ def get_cotacao():
         "vol":   res["indicators"]["quote"][0]["volume"],
     }).dropna(subset=["preco"])
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fundamentais():
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
+
+    def parse_br(txt):
+        """Converte '90,33' ou '1.234,56' para float."""
+        txt = txt.strip().replace("R$","").replace("%","").strip()
+        txt = txt.replace(".","").replace(",",".")
+        return float(txt)
+
+    erros = []
+
+    # ── Fundamentus ──────────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"https://www.fundamentus.com.br/fii_detalhes.php?papel={TICKER}",
+            headers=HEADERS, timeout=10
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        resultado = {}
+        for row in soup.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            for i, cell in enumerate(cells):
+                cu = cell.upper()
+                if "VP/COTA" in cu or "VPA" in cu or "VAL. PATR./COTA" in cu:
+                    if i + 1 < len(cells):
+                        try: resultado["vp"] = parse_br(cells[i+1])
+                        except: pass
+                if "P/VP" in cu:
+                    if i + 1 < len(cells):
+                        try: resultado["pvp"] = parse_br(cells[i+1])
+                        except: pass
+                if "DY" in cu and "12" in cu:
+                    if i + 1 < len(cells):
+                        try: resultado["dy"] = parse_br(cells[i+1])
+                        except: pass
+        if resultado.get("vp"):
+            return resultado
+        erros.append(f"Fundamentus: campos nao encontrados na pagina")
+    except Exception as e:
+        erros.append(f"Fundamentus: {e}")
+
+    # ── Investidor10 ─────────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"https://investidor10.com.br/fiis/{TICKER.lower()}/",
+            headers={**HEADERS, "Referer": "https://investidor10.com.br/"},
+            timeout=12
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        resultado = {}
+        # Investidor10 usa divs com data-label ou title
+        for div in soup.find_all(["div","span","td"], string=True):
+            txt = div.get_text(strip=True).upper()
+            if txt in ("VP", "VPA", "VALOR PATRIMONIAL", "VP/COTA"):
+                sib = div.find_next(["span","div","td","strong"])
+                if sib:
+                    try: resultado["vp"] = parse_br(sib.get_text())
+                    except: pass
+            if txt in ("P/VP", "P/VPA"):
+                sib = div.find_next(["span","div","td","strong"])
+                if sib:
+                    try: resultado["pvp"] = parse_br(sib.get_text())
+                    except: pass
+            if "DY" in txt and ("12M" in txt or "12 M" in txt):
+                sib = div.find_next(["span","div","td","strong"])
+                if sib:
+                    try: resultado["dy"] = parse_br(sib.get_text())
+                    except: pass
+        if resultado.get("vp"):
+            return resultado
+        erros.append(f"Investidor10: campos nao encontrados")
+    except Exception as e:
+        erros.append(f"Investidor10: {e}")
+
+    raise ConnectionError("Nenhuma fonte retornou VP:\n" + "\n".join(erros))
+
 
 def buscar_noticias(query):
     for url in [
@@ -64,9 +146,17 @@ try:
     with st.spinner("Carregando cotacao..."):
         df_hist = get_cotacao()
     vm = df_hist.iloc[-1]["preco"]
-    vp  = st.session_state.get("vp_manual")
-    dy  = st.session_state.get("dy_manual")
-    pvp = round(vm / vp, 2) if vm and vp else None
+    try:
+        fund = get_fundamentais()
+        vp  = fund.get("vp")
+        pvp = fund.get("pvp") or (round(vm/vp, 2) if vm and vp else None)
+        dy  = fund.get("dy")
+    except Exception as ef:
+        vp  = st.session_state.get("vp_manual")
+        dy  = st.session_state.get("dy_manual")
+        pvp = round(vm/vp, 2) if vm and vp else None
+        st.sidebar.warning(f"Scraping falhou: {str(ef)[:120]}")
+    pvp = pvp or (round(vm/vp, 2) if vm and vp else None)
     desagio = round((1 - vm/vp)*100, 1) if vm and vp else None
 
     c1,c2,c3,c4 = st.columns(4)
