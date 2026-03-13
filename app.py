@@ -64,24 +64,37 @@ def get_fundamentais(hg_key: str = ""):
             )
             r.raise_for_status()
             data = r.json()
-            if data.get("valid_key") and "results" in data:
-                d = data["results"].get(TICKER.upper(), {})
-                if d and not d.get("error"):
-                    fin = d.get("financials", {})
-                    div = fin.get("dividends", {})
-                    res = {
-                        "vp":        fin.get("equity_per_share"),
-                        "pvp":       fin.get("price_to_book_ratio"),
-                        "dy_12m":    div.get("yield_12m"),
-                        "dy_rs":     div.get("yield_12m_sum"),   # R$/cota últimos 12m
-                        "vm":        d.get("price"),
-                        "_fonte":    "HG Brasil API",
-                    }
-                    # Remove Nones
-                    res = {k: v for k, v in res.items() if v is not None}
-                    if res.get("vp") or res.get("pvp"):
-                        return res
-            erros.append("HG Brasil: chave inválida ou IBCR11 não encontrado")
+            # Guarda resposta bruta para debug no sidebar
+            st.session_state["hg_debug"] = str(data)[:500]
+
+            results = data.get("results", {})
+            # A chave no results pode ser o ticker com ou sem 11
+            d = results.get(TICKER.upper()) or results.get(TICKER) or (
+                list(results.values())[0] if results else None
+            )
+            if d and isinstance(d, dict) and not d.get("error"):
+                fin = d.get("financials") or {}
+                div = fin.get("dividends") or {}
+                res = {
+                    "vp":     fin.get("equity_per_share"),
+                    "pvp":    fin.get("price_to_book_ratio"),
+                    "dy_12m": div.get("yield_12m"),
+                    "dy_rs":  div.get("yield_12m_sum"),
+                    "vm":     d.get("price"),
+                    "_fonte": "HG Brasil API",
+                }
+                res = {k: v for k, v in res.items() if v is not None}
+                if res.get("vp") or res.get("pvp"):
+                    return res
+                # VP pode ser null para fundos pequenos — usa price_to_book + VM
+                if res.get("vm") and res.get("pvp"):
+                    res["vp"] = round(res["vm"] / res["pvp"], 2)
+                    return res
+                erros.append(f"HG Brasil: IBCR11 retornou mas VP/PVP são null — {str(d.get('financials'))[:100]}")
+            elif data.get("valid_key") is False:
+                erros.append("HG Brasil: chave inválida")
+            else:
+                erros.append(f"HG Brasil: IBCR11 não encontrado — tickers disponíveis: {list(results.keys())[:5]}")
         except Exception as e:
             erros.append(f"HG Brasil: {e}")
     else:
@@ -227,6 +240,9 @@ api_key = st.sidebar.text_input("Anthropic API Key (opcional)", type="password")
 if st.sidebar.button("Limpar cache"):
     st.cache_data.clear()
     st.rerun()
+if st.session_state.get("hg_debug"):
+    st.sidebar.caption("🔍 HG debug:")
+    st.sidebar.code(st.session_state["hg_debug"], language=None)
 st.sidebar.caption("Yahoo Finance + HG Brasil + Google News")
 
 cri_sel = st.selectbox(
