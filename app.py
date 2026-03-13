@@ -50,50 +50,36 @@ def get_fundamentais():
     """
     erros = []
 
-    # Yahoo Finance quoteSummary — mesmo host que já funciona para cotação/histórico
-    # Módulo defaultKeyStatistics: bookValue (VP/cota), priceToBook (P/VP)
-    # Módulo summaryDetail: trailingAnnualDividendYield (DY%), dividendRate (DY R$)
-    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-        try:
-            url = (f"https://{host}/v10/finance/quoteSummary/{TICKER}.SA"
-                   "?modules=defaultKeyStatistics,summaryDetail")
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            qs   = data.get("quoteSummary", {})
-            if qs.get("error"):
-                erros.append(f"Yahoo {host}: {qs['error']}")
-                continue
-            res_list = qs.get("result") or []
-            if not res_list:
-                erros.append(f"Yahoo {host}: result vazio")
-                continue
-            d    = res_list[0]
-            ks   = d.get("defaultKeyStatistics", {})
-            sd   = d.get("summaryDetail", {})
+    # Yahoo Finance v8 chart — mesmo endpoint que já funciona para get_cotacao()
+    # O campo meta do v8 retorna: regularMarketPrice, bookValue, priceToBook,
+    # trailingAnnualDividendRate, trailingAnnualDividendYield
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}.SA"
+               "?interval=1d&range=1d")
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r.raise_for_status()
+        meta = r.json()["chart"]["result"][0]["meta"]
 
-            def raw(obj, key):
-                v = obj.get(key)
-                if isinstance(v, dict):
-                    return v.get("raw")
-                return v
+        def g(key):
+            return meta.get(key) or None
 
-            res = {
-                "vp":     raw(ks, "bookValue"),
-                "pvp":    raw(ks, "priceToBook"),
-                "dy_12m": raw(sd, "trailingAnnualDividendYield"),
-                "dy_rs":  raw(sd, "trailingAnnualDividendRate"),
-                "_fonte": f"Yahoo Finance ({host})",
-            }
-            # dy_12m vem como fração (0.1743) → converte para %
-            if res.get("dy_12m") and res["dy_12m"] < 1:
-                res["dy_12m"] = round(res["dy_12m"] * 100, 2)
-            res = {k: v for k, v in res.items() if v is not None or k == "_fonte"}
-            if res.get("vp") or res.get("pvp"):
-                return res
-            erros.append(f"Yahoo {host}: bookValue/priceToBook null para IBCR11")
-        except Exception as e:
-            erros.append(f"Yahoo {host}: {e}")
+        dy = g("trailingAnnualDividendYield")
+        if dy and dy < 1:
+            dy = round(dy * 100, 2)
+
+        res = {
+            "vp":     g("bookValue"),
+            "pvp":    g("priceToBook"),
+            "dy_12m": dy,
+            "dy_rs":  g("trailingAnnualDividendRate"),
+            "_fonte": "Yahoo Finance v8",
+        }
+        res = {k: v for k, v in res.items() if v is not None or k == "_fonte"}
+        if res.get("vp") or res.get("pvp"):
+            return res
+        erros.append(f"Yahoo v8: bookValue/priceToBook ausentes no meta — campos: {list(meta.keys())}")
+    except Exception as e:
+        erros.append(f"Yahoo v8: {e}")
 
     raise ConnectionError(
         "Yahoo Finance falhou:\n" + "\n".join(f"  • {e}" for e in erros)
