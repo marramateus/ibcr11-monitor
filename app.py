@@ -147,35 +147,56 @@ def get_cotacao(periodo):
     }).dropna(subset=["fechamento"])
     return df
 
-# ── Status Invest scraping ────────────────────────────────────────────────────
+# ── Yahoo Finance: fundamentais (VP, P/VP, DY) ───────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_status_invest():
-    url  = f"https://statusinvest.com.br/fundos-imobiliarios/{TICKER.lower()}"
-    r    = requests.get(url, headers=HEADERS_WEB, timeout=15)
+def get_fundamentais():
+    """
+    Yahoo Finance v10 quoteSummary retorna dados fundamentais incluindo
+    bookValue (VP/cota), priceToBook (P/VP) e dividendYield para FIIs.
+    """
+    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{TICKER}.SA"
+    params = {"modules": "defaultKeyStatistics,summaryDetail,price"}
+    r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    resultado = {}
+    data = r.json()
 
-    # Tenta extrair indicadores dos blocos de dados
-    for div in soup.find_all("div", class_=lambda c: c and "indicator" in c.lower()):
-        titulo = div.find(["span","h3","p"], class_=lambda c: c and ("title" in (c or "").lower() or "label" in (c or "").lower()))
-        valor  = div.find(["strong","span"], class_=lambda c: c and "value" in (c or "").lower())
-        if titulo and valor:
-            t = titulo.get_text(strip=True).upper()
-            v = valor.get_text(strip=True).replace("R$","").replace("%","").replace(".","").replace(",",".").strip()
-            try:
-                v = float(v)
-            except:
-                pass
-            if "VPA" in t or "PATRIM" in t:
-                resultado["vp"] = v
-            elif "P/VP" in t or "P/VPA" in t:
-                resultado["pvp"] = v
-            elif "DY" in t and "12" in t:
-                resultado["dy_12m"] = v
+    if "quoteSummary" not in data or data["quoteSummary"].get("error"):
+        raise ValueError(f"Yahoo Finance quoteSummary erro: {data}")
+
+    result = data["quoteSummary"]["result"]
+    if not result:
+        raise ValueError("Yahoo Finance quoteSummary: resultado vazio")
+
+    ks  = result[0].get("defaultKeyStatistics", {})
+    sd  = result[0].get("summaryDetail", {})
+    pr  = result[0].get("price", {})
+
+    def raw(d, key):
+        v = d.get(key, {})
+        if isinstance(v, dict):
+            return v.get("raw")
+        return v
+
+    vp  = raw(ks, "bookValue")
+    pvp = raw(ks, "priceToBook")
+    dy  = raw(sd, "dividendYield")
+    mc  = raw(pr, "marketCap")
+
+    if dy and dy < 1:   # Yahoo retorna como decimal (0.15 = 15%)
+        dy = round(dy * 100, 2)
+
+    resultado = {}
+    if vp:  resultado["vp"]      = vp
+    if pvp: resultado["pvp"]     = pvp
+    if dy:  resultado["dy_12m"]  = dy
+    if mc:  resultado["market_cap"] = mc
 
     if not resultado:
-        raise ValueError("Status Invest: nenhum indicador extraido. Site pode ter mudado layout.")
+        raise ValueError(
+            f"Yahoo Finance: nenhum campo fundamental retornado.\n"
+            f"defaultKeyStatistics keys: {list(ks.keys())}\n"
+            f"summaryDetail keys: {list(sd.keys())}"
+        )
     return resultado
 
 # ── Noticias RSS ──────────────────────────────────────────────────────────────
@@ -238,7 +259,7 @@ with st.sidebar:
     if st.button("Limpar cache"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Yahoo Finance + Status Invest + CVM Fundos.NET")
+    st.caption("Yahoo Finance (cotacao + fundamentais) + CVM Fundos.NET")
 
 # ── Carrega dados do fundo ────────────────────────────────────────────────────
 cot_ok, cotacao, cot_erro = False, None, None
@@ -252,7 +273,7 @@ except Exception as e:
 si_ok, si, si_erro = False, None, None
 try:
     with st.spinner("Carregando fundamentais..."):
-        si = get_status_invest()
+        si = get_fundamentais()
     si_ok = True
 except Exception as e:
     si_erro = str(e)
@@ -275,7 +296,7 @@ c5.metric("DY 12m",  f"{dy:.2f}%"   if dy else "—")
 
 erros = []
 if not cot_ok: erros.append(f"Yahoo Finance: {cot_erro}")
-if not si_ok:  erros.append(f"Status Invest: {si_erro}")
+if not si_ok:  erros.append(f"Fundamentais Yahoo Finance: {si_erro}")
 if erros:
     with st.expander("Erros de carregamento"):
         for e in erros: st.error(e)
