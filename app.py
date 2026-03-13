@@ -42,92 +42,216 @@ def get_cotacao():
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_fundamentais():
     """
-    Scraping do Clube FII — tabela #primaryTable.
-    Estrutura: <th>Label</th> <td>Valor</td> em cada <tr>.
+    Obtém VP, P/VP e DY do IBCR11. Cascata de fontes:
 
-    Campos extraídos:
-      vp_total  → VALOR PATRIMONIAL (total, ex: 86.572.256)
-      vp        → VP/cota calculado a partir de vp_total / num_cotas
-      pvp       → P/VP
-      dy_ultimo → DY último mês (%)
-      dy_12m    → DY 12 meses (%)
-      cotistas  → Nº de cotistas
-      liquidez  → Liquidez média diária 30d
+      1. Clube FII /fundo_basico (AJAX GET, HTML parcial com #primaryTable)
+         Confirmado 200 OK no DevTools. Requer sessão com cookies Cloudflare.
+         Estratégia: abre sessão na homepage primeiro para obter cf_clearance,
+         depois chama /fundo_basico simulando exatamente o que o browser faz.
+
+      2. Clube FII /pega_cotacao (POST) para cotação tempo-real
+         Retorna texto puro: "51,00;13/03/2026 17:26:42;0,00"
+         Usado como complemento ao fundo_basico se VP/DY já vieram.
+
+      3. Fundamentus — fallback externo sem Cloudflare
     """
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "pt-BR,pt;q=0.9",
-        "Referer": "https://www.clubefii.com.br/",
+    import re, time
+
+    NUM_COTAS = 958_423
+
+    # Headers que replicam exatamente o que o browser envia (confirmado no DevTools)
+    UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    )
+    BASE_HEADERS = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
     }
 
     def parse_br(txt):
-        """'R$ 86.572.256' → 86572256.0  |  '1,18%' → 1.18  |  '0,56' → 0.56"""
-        txt = txt.strip().replace("R$", "").replace("%", "").strip()
-        # Remove pontos de milhar e troca vírgula decimal por ponto
-        txt = txt.replace(".", "").replace(",", ".")
-        return float(txt)
+        t = str(txt).strip().replace("R$","").replace("%","").replace("\xa0","").strip()
+        t = t.replace(".","").replace(",",".")
+        return float(t)
 
-    url = f"https://www.clubefii.com.br/fiis/{TICKER}"
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # Localiza a tabela principal de indicadores
-    table = soup.find("table", {"id": "primaryTable"})
-    if not table:
-        raise ValueError("Clube FII: tabela #primaryTable não encontrada na página")
-
-    resultado = {}
-    for row in table.find_all("tr"):
-        th = row.find("th")
-        td = row.find("td")
-        if not th or not td:
-            continue
-        label = th.get_text(" ", strip=True).upper()
-        valor = td.get_text(" ", strip=True)
-
-        # P/VP
-        if "P/VP" in label:
-            try: resultado["pvp"] = parse_br(valor)
-            except: pass
-
-        # Valor Patrimonial total
-        elif "VALOR PATRIMONIAL" in label:
-            try: resultado["vp_total"] = parse_br(valor)
-            except: pass
-
-        # DY — célula contém "1,18% e 17,43%" → separamos pelos dois valores
-        elif "DIVIDEND YIELD" in label or "DY" in label:
+    def parse_primary_table(html):
+        """Lê #primaryTable e retorna dict com VP, PVP, DY, cotistas, liquidez."""
+        soup  = BeautifulSoup(html, "html.parser")
+        table = soup.find("table", {"id": "primaryTable"})
+        if not table:
+            return {}
+        res = {}
+        for row in table.find_all("tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if not th or not td:
+                continue
+            label = th.get_text(" ", strip=True).upper()
+            valor = td.get_text(" ", strip=True)
             try:
-                partes = valor.replace("%", "").split("e")
+                if "P/VP" in label:
+                    res["pvp"] = parse_br(valor)
+                elif "VALOR PATRIMONIAL" in label:
+                    res["vp_total"] = parse_br(valor)
+                    res["vp"] = round(res["vp_total"] / NUM_COTAS, 2)
+                elif "DIVIDEND YIELD" in label:
+                    # Célula: "1,18% e \n 17,43%"
+                    partes = valor.replace("%","").split("e")
+                    if len(partes) >= 1:
+                        res["dy_ultimo"] = parse_br(partes[0])
+                    if len(partes) >= 2:
+                        res["dy_12m"] = parse_br(partes[1])
+                elif "COTISTAS" in label:
+                    res["cotistas"] = int(parse_br(valor))
+                elif "LIQUIDEZ" in label:
+                    res["liquidez"] = parse_br(valor)
+            except Exception:
+                pass
+        # VP/cota também aparece no bloco .progress — mais preciso que calcular
+        if not res.get("vp"):
+            soup2 = BeautifulSoup(html, "html.parser")
+            for strong in soup2.find_all("strong"):
+                if "patrimonial por cota" in strong.get_text("", strip=True).lower():
+                    prog = strong.find_next("div", class_="progress")
+                    if prog:
+                        span = prog.find("span")
+                        if span:
+                            try:
+                                res["vp"] = parse_br(span.get_text())
+                                break
+                            except Exception:
+                                pass
+        return res
+
+    erros = []
+
+    # ── 1. Clube FII — AJAX /fundo_basico ─────────────────────────────────────
+    # Confirmado 200 OK no DevTools. O browser:
+    #   a) visita a homepage para receber os cookies Cloudflare (cf_clearance)
+    #   b) depois chama GET /fundo_basico com X-Requested-With: XMLHttpRequest
+    # requests.Session() propaga os cookies automaticamente entre as chamadas.
+    try:
+        sess = requests.Session()
+        sess.headers.update(BASE_HEADERS)
+
+        # Passo a: homepage → obtém cookies de sessão (ASP.NET_SessionId, cf_clearance)
+        sess.get("https://www.clubefii.com.br/", timeout=12)
+        time.sleep(0.5)  # pequena pausa, igual browser
+
+        # Passo b: chama o endpoint AJAX exatamente como o jQuery faz
+        r = sess.get(
+            f"https://www.clubefii.com.br/fundo_basico?cod={TICKER}&fiiLiberado=False",
+            headers={
+                "Referer": f"https://www.clubefii.com.br/fiis/{TICKER}",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "text/html, */*; q=0.01",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+
+        res = parse_primary_table(r.text)
+        if res.get("vp") or res.get("pvp"):
+            # Bônus: busca cotação tempo-real via /pega_cotacao (POST simples)
+            try:
+                rc = sess.post(
+                    "https://www.clubefii.com.br/pega_cotacao",
+                    data={"cod_neg": TICKER},
+                    headers={"Referer": f"https://www.clubefii.com.br/fiis/{TICKER}",
+                             "Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=8,
+                )
+                partes = rc.text.strip().split(";")
+                # resposta: "51,00;13/03/2026 17:26:42;0,00"
                 if len(partes) >= 1:
-                    resultado["dy_ultimo"] = parse_br(partes[0])
-                if len(partes) >= 2:
-                    resultado["dy_12m"] = parse_br(partes[1])
-            except: pass
+                    res["vm_rt"] = parse_br(partes[0])   # cotação tempo-real
+                if len(partes) >= 3:
+                    res["var_rt"] = parse_br(partes[2])  # variação %
+            except Exception:
+                pass  # cotação RT é bônus, não bloqueia
 
-        # Nº cotistas
-        elif "COTISTAS" in label:
-            try: resultado["cotistas"] = int(parse_br(valor))
-            except: pass
+            res["_fonte"] = "Clube FII AJAX"
+            return res
 
-        # Liquidez
-        elif "LIQUIDEZ" in label:
-            try: resultado["liquidez"] = parse_br(valor)
-            except: pass
+        erros.append(f"fundo_basico: HTML retornado sem #primaryTable útil")
 
-    # Calcula VP/cota se temos o total e o número de cotas (958.423 é estático)
-    # O número de cotas também está na página secundária; usamos o valor do relatório
-    NUM_COTAS = 958_423
-    if "vp_total" in resultado:
-        resultado["vp"] = round(resultado["vp_total"] / NUM_COTAS, 2)
+    except Exception as e:
+        erros.append(f"fundo_basico: {e}")
 
-    if not resultado.get("pvp") and not resultado.get("vp"):
-        raise ValueError("Clube FII: nenhum campo fundamental encontrado")
+    # ── 2. Clube FII — página principal completa ──────────────────────────────
+    # Fallback: carrega a página toda. Mais pesado mas traz o mesmo #primaryTable.
+    try:
+        sess = requests.Session()
+        sess.headers.update(BASE_HEADERS)
+        sess.get("https://www.clubefii.com.br/", timeout=12)
+        time.sleep(0.8)
 
-    return resultado
+        r = sess.get(
+            f"https://www.clubefii.com.br/fiis/{TICKER}",
+            headers={"Referer": "https://www.clubefii.com.br/fundo_imobiliario_lista"},
+            timeout=25,
+        )
+        r.raise_for_status()
+
+        res = parse_primary_table(r.text)
+
+        # Extrai também variáveis JS inline (embutidas no <script> da página)
+        m = re.search(r"it_val_ultimo_rendimento\s*=\s*([\d.]+)", r.text)
+        if m:
+            try:
+                res["ultimo_rendimento"] = float(m.group(1))
+            except Exception:
+                pass
+
+        if res.get("vp") or res.get("pvp"):
+            res["_fonte"] = "Clube FII (página)"
+            return res
+
+        erros.append("Página principal: Cloudflare bloqueou ou primaryTable vazia")
+
+    except Exception as e:
+        erros.append(f"Página principal: {e}")
+
+    # ── 3. Fundamentus ────────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"https://www.fundamentus.com.br/fii_detalhes.php?papel={TICKER}",
+            headers={**BASE_HEADERS, "Referer": "https://www.fundamentus.com.br/"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        res  = {}
+        for row in soup.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            for i, cell in enumerate(cells):
+                if i + 1 >= len(cells):
+                    continue
+                cu  = cell.upper()
+                val = cells[i + 1]
+                try:
+                    if any(x in cu for x in ("VP/COTA", "VPA", "VAL. PATR./COTA")):
+                        res["vp"] = parse_br(val)
+                    elif cu in ("P/VP", "P/VPA"):
+                        res["pvp"] = parse_br(val)
+                    elif "DY" in cu and "12" in cu:
+                        res["dy_12m"] = parse_br(val)
+                except Exception:
+                    pass
+        if res.get("vp") or res.get("pvp"):
+            res["_fonte"] = "Fundamentus"
+            return res
+        erros.append("Fundamentus: campos não encontrados na página")
+
+    except Exception as e:
+        erros.append(f"Fundamentus: {e}")
+
+    raise ConnectionError(
+        "Todas as fontes falharam:\n" + "\n".join(f"  • {e}" for e in erros)
+    )
 
 
 def buscar_noticias(query):
@@ -155,17 +279,20 @@ try:
         df_hist = get_cotacao()
     vm = df_hist.iloc[-1]["preco"]
     try:
-        fund = get_fundamentais()
+        with st.spinner("Buscando VP/DY..."):
+            fund = get_fundamentais()
         vp     = fund.get("vp")
         pvp    = fund.get("pvp") or (round(vm/vp, 2) if vm and vp else None)
         dy     = fund.get("dy_12m") or fund.get("dy_ultimo")
         dy_ult = fund.get("dy_ultimo")
+        fonte  = fund.get("_fonte", "desconhecida")
+        st.sidebar.success(f"✅ Dados via {fonte}")
     except Exception as ef:
         vp     = st.session_state.get("vp_manual")
         dy     = st.session_state.get("dy_manual")
         dy_ult = None
         pvp    = round(vm/vp, 2) if vm and vp else None
-        st.sidebar.warning(f"Scraping falhou — usando valores manuais: {str(ef)[:120]}")
+        st.sidebar.warning(f"⚠️ Scraping falhou — valores manuais\n\n{str(ef)[:200]}")
     pvp = pvp or (round(vm/vp, 2) if vm and vp else None)
     desagio = round((1 - vm/vp)*100, 1) if vm and vp else None
 
