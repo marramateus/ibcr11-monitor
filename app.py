@@ -30,7 +30,7 @@ COR  = {"CRITICO": "#E24B4A", "ATENCAO": "#EF9F27", "NORMAL": "#1D9E75"}
 # ── brapi.dev ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def get_brapi(periodo: str):
-    token = st.secrets["BRAPI_TOKEN"]
+    token = st.secrets.get("BRAPI_TOKEN", "m2zRCkkvLEoVf4krF6Qtv5")
     url   = f"https://brapi.dev/api/quote/{TICKER}"
     params = {
         "range":       periodo,
