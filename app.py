@@ -28,23 +28,39 @@ COR  = {"CRITICO": "#E24B4A", "ATENCAO": "#EF9F27", "NORMAL": "#1D9E75"}
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
-def get_yahoo():
-    # Cotacao
+def get_cotacao():
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}.SA?interval=1d&range=6mo"
     r   = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
     r.raise_for_status()
     res = r.json()["chart"]["result"][0]
-    df  = pd.DataFrame({
+    return pd.DataFrame({
         "data":  [datetime.fromtimestamp(t).strftime("%Y-%m-%d") for t in res["timestamp"]],
         "preco": res["indicators"]["quote"][0]["close"],
         "vol":   res["indicators"]["quote"][0]["volume"],
     }).dropna(subset=["preco"])
 
-    # Fundamentais
-    url2 = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{TICKER}.SA?modules=defaultKeyStatistics,summaryDetail"
-    r2   = requests.get(url2, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    r2.raise_for_status()
-    res2 = r2.json()["quoteSummary"]["result"][0]
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fundamentais():
+    """
+    Yahoo v8 meta contem regularMarketPrice e as vezes bookValue.
+    Tenta v11 (nao requer auth para alguns campos) como fallback.
+    """
+    # Tenta v11 primeiro (aceita sem cookie em alguns casos)
+    url = f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{TICKER}.SA"
+    params = {"modules": "defaultKeyStatistics,summaryDetail", "crumb": ""}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=10)
+    if r.status_code == 401:
+        raise ConnectionError(
+            "Yahoo Finance bloqueou acesso aos dados fundamentais (401).
+"
+            "VP e DY nao disponiveis sem autenticacao. Cotacao continua funcionando."
+        )
+    r.raise_for_status()
+    res2 = r.json()["quoteSummary"]["result"][0]
 
     def raw(d, k):
         v = d.get(k, {})
@@ -57,8 +73,7 @@ def get_yahoo():
     dy  = raw(sd, "dividendYield")
     if dy and dy < 1:
         dy = round(dy * 100, 2)
-
-    return df, {"vp": vp, "pvp": pvp, "dy": dy}
+    return {"vp": vp, "pvp": pvp, "dy": dy}
 
 def buscar_noticias(query):
     for url in [
@@ -81,12 +96,17 @@ def buscar_noticias(query):
 st.title("IBCR11 — Monitor")
 
 try:
-    with st.spinner("Carregando..."):
-        df_hist, fund = get_yahoo()
-    vm  = df_hist.iloc[-1]["preco"]
-    vp  = fund["vp"]
-    pvp = fund["pvp"]
-    dy  = fund["dy"]
+    with st.spinner("Carregando cotacao..."):
+        df_hist = get_cotacao()
+    vm = df_hist.iloc[-1]["preco"]
+    try:
+        fund = get_fundamentais()
+        vp  = fund.get("vp")
+        pvp = fund.get("pvp")
+        dy  = fund.get("dy")
+    except Exception as ef:
+        st.caption(f"VP/DY indisponiveis: {ef}")
+        vp = pvp = dy = None
     desagio = round((1 - vm/vp)*100, 1) if vm and vp else None
 
     c1,c2,c3,c4 = st.columns(4)
