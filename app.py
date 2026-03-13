@@ -85,38 +85,32 @@ def get_dados_cvm_mes(ano_mes: str) -> dict:
     if not tabelas_all:
         raise ConnectionError(f"Nao foi possivel carregar dados da CVM:\n" + "\n".join(erros))
 
-    # Procura tabela principal (tab_I ou equivalente)
-    tab_principal = None
-    for nome, df in tabelas_all.items():
-        nome_lower = nome.lower()
-        if "tab_i" in nome_lower or "geral" in nome_lower or "resumo" in nome_lower:
-            tab_principal = df
+    # Procura IBCR11 em TODAS as tabelas do ZIP
+    df_fii    = None
+    tab_usada = None
+    cnpj_col  = None
+    tentativas = []
+
+    for nome_tab, df in tabelas_all.items():
+        col = next((c for c in df.columns if "CNPJ" in c), None)
+        if col is None:
+            tentativas.append(f"{nome_tab}: sem coluna CNPJ")
+            continue
+        mask = df[col].str.replace(r"\D", "", regex=True) == CNPJ_IBCR11
+        if mask.any():
+            df_fii    = df[mask].copy()
+            tab_usada = nome_tab
+            cnpj_col  = col
             break
-    # Se nao achou nome especifico, pega a maior tabela
-    if tab_principal is None:
-        tab_principal = max(tabelas_all.values(), key=lambda d: len(d))
+        else:
+            tentativas.append(f"{nome_tab} (col={col}): nao encontrado, ex={df[col].head(2).tolist()}")
 
-    # Filtra pelo CNPJ
-    cnpj_col = next((c for c in tab_principal.columns if "CNPJ" in c and ("FUNDO" in c or "CLASSE" in c)), None)
-    if not cnpj_col:
-        cnpj_col = next((c for c in tab_principal.columns if "CNPJ" in c), None)
-    if not cnpj_col:
+    if df_fii is None or df_fii.empty:
         raise ValueError(
-            f"Coluna CNPJ_FUNDO nao encontrada.\n"
-            f"Tabela usada: {[k for k,v in tabelas_all.items() if v is tab_principal]}\n"
-            f"Colunas disponiveis: {list(tab_principal.columns)}"
+            f"IBCR11 (CNPJ {CNPJ_IBCR11}) nao encontrado em nenhuma tabela.\n"
+            f"Tabelas verificadas:\n" + "\n".join(tentativas)
         )
 
-    df_fii = tab_principal[
-        tab_principal[cnpj_col].str.replace(r"\D", "", regex=True) == CNPJ_IBCR11
-    ].copy()
-
-    if df_fii.empty:
-        raise ValueError(
-            f"IBCR11 (CNPJ {CNPJ_IBCR11}) nao encontrado.\n"
-            f"Coluna usada: {cnpj_col}\n"
-            f"Exemplo de valores: {tab_principal[cnpj_col].head(3).tolist()}"
-        )
 
     # Filtra pelo mes
     data_col = next((c for c in df_fii.columns if any(x in c for x in ["COMPET", "DT_REF", "DATA", "REFERENCIA"])), None)
