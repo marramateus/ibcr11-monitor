@@ -40,105 +40,63 @@ def get_cotacao():
     }).dropna(subset=["preco"])
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_fundamentais(hg_key: str = ""):
+def get_fundamentais():
     """
-    Obtém VP, P/VP e DY do IBCR11 via HG Brasil Finance API.
-    Endpoint: GET https://api.hgbrasil.com/finance/stock_price?key=KEY&symbol=IBCR11
-    Retorna: equity_per_share (VP/cota), price_to_book_ratio (P/VP),
-             dividends.yield_12m (DY 12m), price (VM), dividends.yield_12m_sum (DY R$)
-    Fallback: Fundamentus (sem autenticação, sem Cloudflare)
+    Obtém VP, P/VP e DY do IBCR11 via Yahoo Finance quoteSummary.
+    Endpoint: /v10/finance/quoteSummary/IBCR11.SA
+    Módulos: defaultKeyStatistics + summaryDetail
+    Retorna: bookValue (VP/cota), priceToBook (P/VP),
+             trailingAnnualDividendYield (DY 12m%), trailingAnnualDividendRate (DY R$)
     """
     erros = []
 
-    # ── 1. HG Brasil Finance API ──────────────────────────────────────────────
-    # API REST brasileira, JSON limpo, sem Cloudflare.
-    # Retorna: equity_per_share (VP/cota), price_to_book_ratio (P/VP),
-    #          dividends.yield_12m (DY%), dividends.yield_12m_sum (DY R$), price (VM)
-    # Chave gratuita: console.hgbrasil.com → ~100 req/dia no plano free
-    if hg_key:
+    # Yahoo Finance quoteSummary — mesmo host que já funciona para cotação/histórico
+    # Módulo defaultKeyStatistics: bookValue (VP/cota), priceToBook (P/VP)
+    # Módulo summaryDetail: trailingAnnualDividendYield (DY%), dividendRate (DY R$)
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
         try:
-            r = requests.get(
-                "https://api.hgbrasil.com/finance/stock_price",
-                params={"key": hg_key, "symbol": TICKER},
-                timeout=10,
-            )
+            url = (f"https://{host}/v10/finance/quoteSummary/{TICKER}.SA"
+                   "?modules=defaultKeyStatistics,summaryDetail")
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             r.raise_for_status()
             data = r.json()
-            # Guarda resposta bruta para debug no sidebar
-            st.session_state["hg_debug"] = str(data)[:500]
+            qs   = data.get("quoteSummary", {})
+            if qs.get("error"):
+                erros.append(f"Yahoo {host}: {qs['error']}")
+                continue
+            res_list = qs.get("result") or []
+            if not res_list:
+                erros.append(f"Yahoo {host}: result vazio")
+                continue
+            d    = res_list[0]
+            ks   = d.get("defaultKeyStatistics", {})
+            sd   = d.get("summaryDetail", {})
 
-            results = data.get("results", {})
-            # A chave no results pode ser o ticker com ou sem 11
-            d = results.get(TICKER.upper()) or results.get(TICKER) or (
-                list(results.values())[0] if results else None
-            )
-            if d and isinstance(d, dict) and not d.get("error"):
-                fin = d.get("financials") or {}
-                div = fin.get("dividends") or {}
-                res = {
-                    "vp":     fin.get("equity_per_share"),
-                    "pvp":    fin.get("price_to_book_ratio"),
-                    "dy_12m": div.get("yield_12m"),
-                    "dy_rs":  div.get("yield_12m_sum"),
-                    "vm":     d.get("price"),
-                    "_fonte": "HG Brasil API",
-                }
-                res = {k: v for k, v in res.items() if v is not None}
-                if res.get("vp") or res.get("pvp"):
-                    return res
-                # VP pode ser null para fundos pequenos — usa price_to_book + VM
-                if res.get("vm") and res.get("pvp"):
-                    res["vp"] = round(res["vm"] / res["pvp"], 2)
-                    return res
-                erros.append(f"HG Brasil: IBCR11 retornou mas VP/PVP são null — {str(d.get('financials'))[:100]}")
-            elif data.get("valid_key") is False:
-                erros.append("HG Brasil: chave inválida")
-            else:
-                erros.append(f"HG Brasil: IBCR11 não encontrado — tickers disponíveis: {list(results.keys())[:5]}")
+            def raw(obj, key):
+                v = obj.get(key)
+                if isinstance(v, dict):
+                    return v.get("raw")
+                return v
+
+            res = {
+                "vp":     raw(ks, "bookValue"),
+                "pvp":    raw(ks, "priceToBook"),
+                "dy_12m": raw(sd, "trailingAnnualDividendYield"),
+                "dy_rs":  raw(sd, "trailingAnnualDividendRate"),
+                "_fonte": f"Yahoo Finance ({host})",
+            }
+            # dy_12m vem como fração (0.1743) → converte para %
+            if res.get("dy_12m") and res["dy_12m"] < 1:
+                res["dy_12m"] = round(res["dy_12m"] * 100, 2)
+            res = {k: v for k, v in res.items() if v is not None or k == "_fonte"}
+            if res.get("vp") or res.get("pvp"):
+                return res
+            erros.append(f"Yahoo {host}: bookValue/priceToBook null para IBCR11")
         except Exception as e:
-            erros.append(f"HG Brasil: {e}")
-    else:
-        erros.append("HG Brasil: sem chave configurada")
-
-    # ── 2. Fundamentus ────────────────────────────────────────────────────────
-    # Sem autenticação, sem Cloudflare. Dados atualizados após fechamento.
-    try:
-        r = requests.get(
-            f"https://www.fundamentus.com.br/fii_detalhes.php?papel={TICKER}",
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.fundamentus.com.br/"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        res  = {}
-        for row in soup.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in row.find_all("td")]
-            for i, cell in enumerate(cells):
-                if i + 1 >= len(cells):
-                    continue
-                cu  = cell.upper()
-                val = cells[i + 1]
-                try:
-                    def p(t):
-                        t = t.strip().replace("R$","").replace("%","").replace("\xa0","").strip()
-                        return float(t.replace(".","").replace(",","."))
-                    if any(x in cu for x in ("VP/COTA", "VPA", "VAL. PATR./COTA")):
-                        res["vp"] = p(val)
-                    elif cu in ("P/VP", "P/VPA"):
-                        res["pvp"] = p(val)
-                    elif "DY" in cu and "12" in cu:
-                        res["dy_12m"] = p(val)
-                except Exception:
-                    pass
-        if res.get("vp") or res.get("pvp"):
-            res["_fonte"] = "Fundamentus"
-            return res
-        erros.append("Fundamentus: campos não encontrados")
-    except Exception as e:
-        erros.append(f"Fundamentus: {e}")
+            erros.append(f"Yahoo {host}: {e}")
 
     raise ConnectionError(
-        "Todas as fontes falharam:\n" + "\n".join(f"  • {e}" for e in erros)
+        "Yahoo Finance falhou:\n" + "\n".join(f"  • {e}" for e in erros)
     )
 
 
@@ -166,10 +124,10 @@ try:
     with st.spinner("Carregando cotacao..."):
         df_hist = get_cotacao()
     vm = df_hist.iloc[-1]["preco"]
-    hg_key = st.session_state.get("hg_key", "")
+    hg_key = ""
     try:
         with st.spinner("Buscando VP/DY..."):
-            fund = get_fundamentais(hg_key)
+            fund = get_fundamentais()
         vp     = fund.get("vp")
         pvp    = fund.get("pvp") or (round(vm/vp, 2) if vm and vp else None)
         dy     = fund.get("dy_12m") or fund.get("dy_ultimo")
@@ -211,20 +169,7 @@ if df_hist is not None:
 
 st.divider()
 
-# ── Painel de CRIs ────────────────────────────────────────────────────────────
-st.sidebar.subheader("Configuração")
-hg_key_input = st.sidebar.text_input(
-    "HG Brasil API Key",
-    value=st.session_state.get("hg_key", ""),
-    type="password",
-    help="Chave gratuita em console.hgbrasil.com — retorna VP, P/VP e DY via JSON"
-)
-if hg_key_input != st.session_state.get("hg_key", ""):
-    st.session_state["hg_key"] = hg_key_input
-    st.cache_data.clear()
-    st.rerun()
-
-st.sidebar.divider()
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.subheader("Valores manuais (fallback)")
 vp_input = st.sidebar.number_input("VP/cota (R$) — atualizar mensalmente",
     min_value=0.0, value=st.session_state.get("vp_manual", 90.33), step=0.01, format="%.2f")
@@ -240,10 +185,7 @@ api_key = st.sidebar.text_input("Anthropic API Key (opcional)", type="password")
 if st.sidebar.button("Limpar cache"):
     st.cache_data.clear()
     st.rerun()
-if st.session_state.get("hg_debug"):
-    st.sidebar.caption("🔍 HG debug:")
-    st.sidebar.code(st.session_state["hg_debug"], language=None)
-st.sidebar.caption("Yahoo Finance + HG Brasil + Google News")
+st.sidebar.caption("Yahoo Finance + Google News")
 
 cri_sel = st.selectbox(
     "Selecionar CRI",
